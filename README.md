@@ -80,7 +80,7 @@ Use these credentials in your IPTV player:
 
 - **Server URL**: `http://YOUR_SERVER_IP:8080`
 - **Username**: `admin` (or whatever you set in settings)
-- **Password**: `password` (or whatever you set in settings)
+- **Password**: `yoursetpassword` (or whatever you set in settings)
 - **Type**: Xtream Codes API
 
 ## 📱 Supported IPTV Players
