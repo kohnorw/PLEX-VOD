@@ -49,7 +49,7 @@ cd PLEX-VOD
 
 ```bash
 chmod +x install.sh
-./install.sh --install-service
+./install.sh
 ```
 
 The installer will:
