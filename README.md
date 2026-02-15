@@ -70,7 +70,7 @@ Default credentials:
 - Password: `admin123` (you'll be forced to change this on first login)
 
 Configure:
-1. **Plex Server URL** - Your Plex server address (e.g., `http://192.168.1.100:32400`)
+1. **Plex Server URL** - Your Plex server address (e.g., `http://192.168.1.100:32400/`)
 2. **Plex Token** - [Get your Plex token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/)
 3. **TMDb API Key** (optional) - [Get a free TMDb API key](https://www.themoviedb.org/settings/api)
 
