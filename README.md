@@ -57,6 +57,7 @@ The installer will:
 - Create a Python virtual environment
 - Install required Python packages
 - Set up the systemd service (if `--install-service` flag is used)
+- Run using python3 plex_xtream_bridge_web.py
 
 ### 3. Configure the Bridge
 
