@@ -124,6 +124,39 @@ source venv/bin/activate
 python3 plex_xtream_bridge_web.py
 ```
 
+### Option 3: Docker / Portainer
+
+**See [PORTAINER.md](PORTAINER.md) for complete Docker deployment guide.**
+
+Quick start with Docker:
+
+```bash
+# Build the image
+docker build -t plex-xtream-bridge:latest .
+
+# Run the container
+docker run -d \
+  --name plex-xtream-bridge \
+  -p 8080:8080 \
+  -v $(pwd)/data:/app/data \
+  --restart unless-stopped \
+  plex-xtream-bridge:latest
+```
+
+Or use docker-compose:
+
+```bash
+docker-compose up -d
+```
+
+**Portainer Deployment:**
+1. Open Portainer
+2. Go to **Stacks** → **+ Add stack**
+3. Paste the contents from `docker-compose.yml`
+4. Deploy!
+
+See [PORTAINER.md](PORTAINER.md) for detailed instructions.
+
 ## 📖 Configuration
 
 ### Settings Page
