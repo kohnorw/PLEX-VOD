@@ -42,7 +42,7 @@ Transform your Plex Media Server into an Xtream Codes API-compatible IPTV servic
 
 ```bash
 git clone https://github.com/kohnorw/PLEX-VOD.git
-cd plex-xtream-bridge
+cd PLEX-VOD
 ```
 
 ### 2. Run the Installer
