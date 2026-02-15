@@ -17,9 +17,9 @@ This bridge transforms your Plex Media Server into an Xtream Codes API service, 
 ## 🚀 Quick Start (Portainer)
 
 **The easiest way to run this is with Docker/Portainer:**
-
+```yaml
 docker pull ghcr.io/kohnorw/plex-vod:latest
-
+```
 ### Step 1: Deploy in Portainer
 
 1. Open Portainer → **Stacks** → **+ Add stack**
