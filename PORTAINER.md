@@ -64,39 +64,7 @@ Default credentials:
 
 ---
 
-## Method 2: Portainer Custom Template
-
-### Create a Custom Template
-
-1. Go to **App Templates**
-2. Click **+ Add Custom Template**
-3. Fill in:
-
-**Title:** Plex Xtream Bridge
-
-**Description:** Transform Plex into an Xtream Codes API for IPTV players
-
-**Platform:** Linux
-
-**Type:** Container
-
-**Image:** `plex-xtream-bridge:latest`
-
-**Network:** bridge
-
-**Restart Policy:** Unless stopped
-
-**Port Mapping:**
-- Host: 8080
-- Container: 8080
-
-**Volume:**
-- Container: `/app/data`
-- Bind: `/path/to/data`
-
----
-
-## Method 3: Docker Run (Manual)
+## Method 2: Docker Run (Manual)
 
 In Portainer's **Containers** section:
 
