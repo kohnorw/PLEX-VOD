@@ -23,7 +23,6 @@ docker build -t plex-xtream-bridge:latest .
 4. **Name your stack** - e.g., "plex-xtream-bridge"
 5. **Paste this compose file:**
 
-```yaml
 version: '3.8'
 
 services:
