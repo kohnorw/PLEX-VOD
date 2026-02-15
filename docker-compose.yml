@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  plex-xtream-bridge:
+    image: plex-xtream-bridge:latest
+    container_name: plex-xtream-bridge
+    restart: unless-stopped
+    
+    ports:
+      - "8080:8080"
+    
+    volumes:
+      # Persist configuration and cache
+      - ./data:/app/data
+    
+    environment:
+      # Optional: Override default settings
+      - BRIDGE_HOST=0.0.0.0
+      - BRIDGE_PORT=8080
+      # - PLEX_URL=http://your-plex-server:32400
+      # - PLEX_TOKEN=your-plex-token
+      # - TMDB_API_KEY=your-tmdb-key
+    
+    networks:
+      - plex-bridge-network
+    
+    # Optional: If Plex is also in Docker
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+networks:
+  plex-bridge-network:
+    driver: bridge
