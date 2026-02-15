@@ -9,16 +9,11 @@ First, build the image locally or use GitHub Actions to build it.
 **Local Build:**
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/plex-xtream-bridge.git
-cd plex-xtream-bridge
+git clone https://github.com/kohnorw/PLEX-VOD.git
+cd PLEX-VOD
 
 # Build the image
 docker build -t plex-xtream-bridge:latest .
-
-# Optional: Tag and push to Docker Hub
-docker tag plex-xtream-bridge:latest yourusername/plex-xtream-bridge:latest
-docker push yourusername/plex-xtream-bridge:latest
-```
 
 ### Step 2: Deploy in Portainer
 
