@@ -1,315 +1,307 @@
-# Plex Xtream Bridge
+# Plex VOD Bridge
 
-Transform your Plex Media Server into an Xtream Codes API-compatible IPTV service. Access your Plex content through any IPTV player that supports Xtream Codes API (TiviMate, IPTV Smarters, etc.).
+Turn your Plex library into an IPTV service! Watch your Plex movies and TV shows in any IPTV player like TiviMate, IPTV Smarters, and more.
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
-![Plex](https://img.shields.io/badge/plex-compatible-orange.svg)
+![Docker](https://img.shields.io/badge/docker-ready-blue.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-## ✨ Features
+## 🎯 What Does This Do?
 
-### Core Functionality
-- 🎬 **Full Plex Integration** - Access all your movies and TV shows
-- 📺 **Xtream Codes API** - Compatible with popular IPTV players
-- 🖼️ **TMDb Integration** - High-quality posters and metadata (optional)
-- 🔄 **Auto-Matching** - Automatically fetches TMDb posters every 30 minutes
-- 💾 **Persistent Cache** - TMDb matches survive restarts
-- 🎯 **Manual Matching** - Search and fix TMDb matches for any content
+This bridge transforms your Plex Media Server into an Xtream Codes API service, allowing you to:
+- ✅ Access your Plex movies and TV shows through any IPTV player
+- ✅ Get high-quality movie posters from TMDb (optional)
+- ✅ Browse your entire library with beautiful artwork
+- ✅ Stream directly from Plex to your IPTV app
 
-### Web Interface
-- 🌐 **Modern Admin Panel** - Easy configuration and management
-- 🔍 **Search & Match** - Find and manually match content to TMDb
-- 📄 **Pagination** - Browse through all unmatched content
-- 📊 **Library Stats** - View your Plex libraries at a glance
-- 🔐 **Secure Authentication** - Password-protected admin interface
+## 🚀 Quick Start (Portainer)
 
-### Performance
-- ⚡ **Lightning Fast** - Optimized for multiple concurrent users
-- 🚀 **Multi-threaded** - Handle many users simultaneously
-- 💽 **Smart Caching** - Session-based caching for instant responses
-- 🔄 **Auto-Refresh** - Library sections cached for 5 minutes
+**The easiest way to run this is with Docker/Portainer:**
 
-## 📋 Requirements
+### Step 1: Deploy in Portainer
 
-- Python 3.8 or higher
-- Plex Media Server with active content
-- TMDb API key (optional, for high-quality posters)
-- Linux/Ubuntu server (tested on Ubuntu 24.04)
+1. Open Portainer → **Stacks** → **+ Add stack**
+2. Name it: `plex-vod`
+3. Paste this:
 
-## 🚀 Quick Start
+```yaml
+version: '3.8'
 
-### 1. Clone the Repository
+services:
+  plex-vod:
+    image: ghcr.io/kohnorw/plex-vod:latest
+    container_name: plex-vod
+    restart: unless-stopped
+    
+    ports:
+      - "8080:8080"
+    
+    volumes:
+      - plex-vod-data:/app/data
+    
+    environment:
+      - BRIDGE_HOST=0.0.0.0
+      - BRIDGE_PORT=8080
 
-```bash
-git clone https://github.com/kohnorw/PLEX-VOD.git
-cd PLEX-VOD
+volumes:
+  plex-vod-data:
 ```
 
-### 2. Run the Installer
+4. Click **Deploy the stack**
 
-```bash
-chmod +x install.sh
-./install.sh
-```
+### Step 2: Configure
 
-The installer will:
-- Install system dependencies (Python, pip, venv)
-- Create a Python virtual environment
-- Install required Python packages
-- Set up the systemd service (if `--install-service` flag is used)
-- Run using python3 plex_xtream_bridge_web.py
+Visit: `http://YOUR_SERVER_IP:8080/admin`
 
-### 3. Configure the Bridge
-
-Visit the admin panel:
-```
-http://YOUR_SERVER_IP:8080/admin
-```
-
-Default credentials:
+**Login with:**
 - Username: `admin`
-- Password: `admin123` (you'll be forced to change this on first login)
+- Password: `admin123` (you'll change this on first login)
 
-Configure:
-1. **Plex Server URL** - Your Plex server address (e.g., `http://192.168.1.100:32400/`)
-2. **Plex Token** - [Get your Plex token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/)
-3. **TMDb API Key** (optional) - [Get a free TMDb API key](https://www.themoviedb.org/settings/api)
+**Add your Plex info:**
+1. **Plex Server URL** - Usually `http://192.168.1.X:32400`
+2. **Plex Token** - [How to find your Plex token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/)
+3. **TMDb API Key** (optional) - [Get free API key](https://www.themoviedb.org/settings/api) for high-quality posters
 
-### 4. Add to Your IPTV Player
+### Step 3: Add to IPTV Player
 
-Use these credentials in your IPTV player:
+**In TiviMate, IPTV Smarters, or any Xtream player:**
 
 - **Server URL**: `http://YOUR_SERVER_IP:8080`
-- **Username**: `admin` (or whatever you set in settings)
-- **Password**: `yoursetpassword` (or whatever you set in settings)
+- **Username**: `admin` (or what you set)
+- **Password**: Your bridge password (set in settings)
 - **Type**: Xtream Codes API
 
-## 📱 Supported IPTV Players
-
-Tested and working with:
-- ✅ TiviMate
-- ✅ IPTV Smarters Pro
-- ✅ Chilio
-- ✅ Dispatcharr
-- ✅ Perfect Player
-- ✅ GSE Smart IPTV
-
-## 🛠️ Installation Options
-
-### Option 1: Systemd Service (Recommended)
-
-```bash
-./install.sh --install-service
-```
-
-Manage the service:
-```bash
-# Start the service
-sudo systemctl start plex-xtream-bridge
-
-# Stop the service
-sudo systemctl stop plex-xtream-bridge
-
-# Restart the service
-sudo systemctl restart plex-xtream-bridge
-
-# View logs
-sudo journalctl -u plex-xtream-bridge -f
-```
-
-### Option 2: Manual Start
-
-```bash
-./install.sh
-source venv/bin/activate
-python3 plex_xtream_bridge_web.py
-```
-
-### Option 3: Docker / Portainer
-
-**See [PORTAINER.md](PORTAINER.md) for complete Docker deployment guide.**
-
-Quick start with Docker:
-
-```bash
-# Build the image
-docker build -t plex-xtream-bridge:latest .
-
-# Run the container
-docker run -d \
-  --name plex-xtream-bridge \
-  -p 8080:8080 \
-  -v $(pwd)/data:/app/data \
-  --restart unless-stopped \
-  plex-xtream-bridge:latest
-```
-
-Or use docker-compose:
-
-```bash
-docker-compose up -d
-```
-
-**Portainer Deployment:**
-1. Open Portainer
-2. Go to **Stacks** → **+ Add stack**
-3. Paste the contents from `docker-compose.yml`
-4. Deploy!
-
-See [PORTAINER.md](PORTAINER.md) for detailed instructions.
-
-## 📖 Configuration
-
-### Settings Page
-
-Access via: `http://YOUR_SERVER_IP:8080/admin/settings`
-
-**Plex Configuration:**
-- Plex Server URL
-- Plex Token
-
-**Authentication:**
-- Bridge Username (for IPTV players)
-- Bridge Password (for IPTV players)
-- Admin Password (for web interface)
-
-**Optional Features:**
-- TMDb API Key (for high-quality posters)
-
-## 🎬 TMDb Integration
-
-### Why Use TMDb?
-
-- 🖼️ **High-Quality Posters** - Professional movie/TV posters
-- 📊 **Rich Metadata** - Cast, crew, ratings, trailers
-- 🌐 **Universal URLs** - Works from anywhere (no Plex token needed)
-
-### Auto-Matching
-
-When TMDb is configured:
-- Runs automatically on startup
-- Re-runs every 30 minutes
-- Matches new content automatically
-- Saves matches to disk (survives restarts)
-
-### Manual Matching
-
-Visit: `http://YOUR_SERVER_IP:8080/admin/match-tmdb`
-
-Features:
-- 🔍 **Search your Plex library** - Find any movie or TV show
-- 🎯 **Search TMDb** - Find the correct match
-- ✅ **One-click matching** - Click to match
-- 📄 **Pagination** - Browse through all unmatched content
-- 🔄 **Trigger auto-match** - Run matching on demand
-
-## 🔧 Advanced Configuration
-
-### File Locations
-
-```
-your-install-directory/
-├── plex_xtream_bridge_web.py  # Main application
-├── install.sh                  # Installation script
-├── venv/                       # Python virtual environment
-└── data/                       # Data directory
-    ├── config.json             # Configuration (encrypted)
-    └── tmdb_cache.json         # TMDb matches cache
-```
-
-### Port Configuration
-
-Default port: `8080`
-
-To change, edit the config file or set environment variable:
-```bash
-export BRIDGE_PORT=9090
-```
-
-### Network Access
-
-Make sure port 8080 is accessible:
-```bash
-sudo ufw allow 8080
-```
-
-## 🔐 Security
-
-- 🔒 **Encrypted Storage** - API keys and tokens are encrypted with AES-256
-- 🔑 **Hashed Passwords** - Passwords stored with SHA-256 hashing
-- 🛡️ **Secure Sessions** - Flask sessions with secret keys
-- 📝 **First-Time Password Change** - Forces password change on first login
-- 🔐 **File Permissions** - Config files have restricted permissions (600)
-
-## 📊 Performance Tips
-
-### For Multiple Users
-
-The bridge is optimized for concurrent users:
-- Multi-threaded request handling
-- Session-based caching
-- Library section caching (5-minute refresh)
-- Minimal response sizes
-
-### For Large Libraries
-
-- TMDb auto-matching runs in background
-- Pagination prevents timeouts
-- Maximum 500 movies per request (configurable)
-- Maximum 300 TV shows per request (configurable)
-
-## 🐛 Troubleshooting
-
-### Bridge Won't Start
-
-Check logs:
-```bash
-sudo journalctl -u plex-xtream-bridge -n 50
-```
-
-Common issues:
-- Port already in use (change port in config)
-- Missing Python dependencies (run installer again)
-- Plex not accessible (check Plex URL and token)
-
-### No Posters in IPTV Player
-
-1. Check if TMDb is configured (optional)
-2. Verify TMDb API key is valid
-3. Check if auto-match has run
-4. Try manual matching
-
-### Content Not Showing
-
-1. Verify Plex connection in admin panel
-2. Check Plex token is valid
-3. Ensure content is in Plex libraries
-4. Check IPTV player credentials
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## 📝 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## ⚠️ Disclaimer
-
-This project is not affiliated with Plex Inc. or TMDb. It's a third-party bridge that uses the Plex API and TMDb API.
-
-## 🙏 Acknowledgments
-
-- [Plex](https://www.plex.tv/) - For the amazing media server
-- [TMDb](https://www.themoviedb.org/) - For the movie/TV metadata
-- [PlexAPI](https://github.com/pkkid/python-plexapi) - Python library for Plex
-
-## 📞 Support
-
-- Open an issue on GitHub
-- Check existing issues for solutions
-- Review the troubleshooting section
+**Done!** 🎉 Your Plex library is now in your IPTV player!
 
 ---
 
-Made with ❤️ for the Plex community
+## 💻 Other Installation Methods
+
+<details>
+<summary><b>Docker Command Line</b></summary>
+
+```bash
+docker run -d \
+  --name plex-vod \
+  -p 8080:8080 \
+  -v plex-vod-data:/app/data \
+  --restart unless-stopped \
+  ghcr.io/kohnorw/plex-vod:latest
+```
+</details>
+
+<details>
+<summary><b>Docker Compose</b></summary>
+
+Create `docker-compose.yml`:
+
+```yaml
+version: '3.8'
+
+services:
+  plex-vod:
+    image: ghcr.io/kohnorw/plex-vod:latest
+    container_name: plex-vod
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - plex-vod-data:/app/data
+
+volumes:
+  plex-vod-data:
+```
+
+Run: `docker-compose up -d`
+</details>
+
+<details>
+<summary><b>Linux Install (without Docker)</b></summary>
+
+```bash
+# Clone the repository
+git clone https://github.com/kohnorw/plex-vod.git
+cd plex-vod
+
+# Run installer
+chmod +x install.sh
+./install.sh --install-service
+
+# Access at http://YOUR_IP:8080/admin
+```
+</details>
+
+---
+
+## 🎬 Features
+
+### Core Features
+- 🎥 **Full Plex Integration** - All your movies and TV shows
+- 📺 **Xtream Codes API** - Works with all IPTV players
+- 🖼️ **TMDb Posters** - High-quality artwork (optional)
+- 🔄 **Auto-Matching** - Automatically fetches posters every 30 minutes
+- 💾 **Persistent Cache** - Saves poster matches (survives restarts)
+
+### Admin Features
+- 🌐 **Web Interface** - Easy configuration
+- 🔍 **Manual Matching** - Search and fix poster matches
+- 📄 **Pagination** - Browse all your content
+- 🔐 **Secure** - Password protected
+
+### Performance
+- ⚡ **Multi-User** - Handles many users at once
+- 🚀 **Fast** - Optimized caching
+- 💪 **Reliable** - Auto-restart on errors
+
+---
+
+## 📱 Tested IPTV Players
+
+Works perfectly with:
+- ✅ **TiviMate** (Recommended)
+- ✅ **IPTV Smarters Pro**
+- ✅ **Chilio**
+- ✅ **Dispatcharr**
+- ✅ **Perfect Player**
+- ✅ **GSE Smart IPTV**
+
+---
+
+## 🔧 Configuration
+
+### Required Settings
+- **Plex Server URL** - Your Plex server address
+- **Plex Token** - Authentication token from Plex
+
+### Optional Settings
+- **TMDb API Key** - For high-quality posters (free)
+- **Bridge Username** - For IPTV player login
+- **Bridge Password** - For IPTV player login
+
+### How to Get Plex Token
+
+1. Open Plex Web App
+2. Play any movie/show
+3. Click **"..."** → **Get Info**
+4. Click **"View XML"**
+5. Look in the URL: `X-Plex-Token=YOUR_TOKEN_HERE`
+
+[Full guide here](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/)
+
+### How to Get TMDb API Key (Optional)
+
+1. Create account at [TMDb.org](https://www.themoviedb.org/)
+2. Go to [Settings → API](https://www.themoviedb.org/settings/api)
+3. Request API key (free)
+4. Copy the **"API Key (v3 auth)"**
+
+---
+
+## 🐛 Troubleshooting
+
+### Can't access web interface
+
+**Check container is running:**
+```bash
+docker ps | grep plex-vod
+```
+
+**Check logs:**
+```bash
+docker logs plex-vod
+```
+
+**Check port:**
+```bash
+netstat -tlnp | grep 8080
+```
+
+### Can't connect to Plex
+
+- ✅ Make sure Plex URL is correct
+- ✅ Make sure Plex Token is valid
+- ✅ Try accessing Plex URL from the container
+- ✅ If Plex is in Docker, use `http://host.docker.internal:32400`
+
+### No posters in IPTV player
+
+- ✅ Add TMDb API key (optional but recommended)
+- ✅ Wait for auto-match to run (30 minutes)
+- ✅ Or manually trigger: Click "Auto-Match Unmatched" in admin
+
+### Content not showing
+
+- ✅ Verify Plex connection in admin panel
+- ✅ Check credentials in IPTV player
+- ✅ Make sure content exists in Plex libraries
+
+---
+
+## 📊 How It Works
+
+```
+┌─────────────┐         ┌──────────────┐         ┌────────────┐
+│             │         │              │         │            │
+│  Plex VOD   │◄────────│     Plex     │◄────────│   TMDb     │
+│   Bridge    │  Auth   │    Server    │  Meta   │    API     │
+│             │         │              │         │  (optional)│
+└──────┬──────┘         └──────────────┘         └────────────┘
+       │
+       │ Xtream API
+       │
+       ▼
+┌─────────────┐
+│   IPTV      │
+│   Player    │
+│  (TiviMate) │
+└─────────────┘
+```
+
+1. Bridge connects to your Plex server
+2. Optionally fetches high-quality posters from TMDb
+3. Exposes everything via Xtream Codes API
+4. IPTV players connect and stream from Plex
+
+---
+
+## 🔐 Security
+
+- 🔒 **Encrypted Storage** - API keys encrypted with AES-256
+- 🔑 **Hashed Passwords** - SHA-256 password hashing
+- 🛡️ **Session Security** - Secure Flask sessions
+- 📝 **Force Password Change** - Must change default password
+
+**Important:** Change the default password on first login!
+
+---
+
+## 🆘 Support
+
+**Need help?**
+- 📖 Check the [Troubleshooting](#-troubleshooting) section
+- 💬 [Open an issue](https://github.com/kohnorw/plex-vod/issues)
+- 📚 See full documentation in [PORTAINER.md](PORTAINER.md) and [GHCR.md](GHCR.md)
+
+---
+
+## 📝 License
+
+MIT License - see [LICENSE](LICENSE) file
+
+---
+
+## 🙏 Credits
+
+- **Plex** - Amazing media server
+- **TMDb** - Movie/TV metadata and artwork
+- **PlexAPI** - Python library for Plex
+
+---
+
+## ⭐ Star This Repo
+
+If this helped you, give it a star! ⭐ It helps others find it too.
+
+---
+
+**Made with ❤️ for the Plex community**
