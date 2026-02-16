@@ -3153,10 +3153,25 @@ def player_api():
             "server_info": server_info
         })
     
-    # Get VOD categories
-    # Get VOD categories - DISABLED, return empty
+    # Get VOD categories - Auto-generated from Plex libraries
     elif action == 'get_vod_categories':
-        return jsonify([])
+        categories = []
+        
+        if plex:
+            try:
+                sections = get_cached_sections()
+                for section in sections:
+                    if section.type == 'movie':
+                        # Each movie library becomes a category
+                        categories.append({
+                            "category_id": str(section.key),
+                            "category_name": section.title,
+                            "parent_id": 0
+                        })
+            except Exception as e:
+                print(f"[ERROR] Failed to get VOD categories: {e}")
+        
+        return jsonify(categories)
     
     # Get VOD streams (movies)
     elif action == 'get_vod_streams':
@@ -3290,10 +3305,25 @@ def player_api():
         except Exception as e:
             return jsonify({"error": str(e)}), 404
     
-    # Get series categories
-    # Get series categories - DISABLED, return empty
+    # Get series categories - Auto-generated from Plex libraries
     elif action == 'get_series_categories':
-        return jsonify([])
+        categories = []
+        
+        if plex:
+            try:
+                sections = get_cached_sections()
+                for section in sections:
+                    if section.type == 'show':
+                        # Each TV library becomes a category
+                        categories.append({
+                            "category_id": str(section.key),
+                            "category_name": section.title,
+                            "parent_id": 0
+                        })
+            except Exception as e:
+                print(f"[ERROR] Failed to get series categories: {e}")
+        
+        return jsonify(categories)
     
     # Get series
     elif action == 'get_series':
