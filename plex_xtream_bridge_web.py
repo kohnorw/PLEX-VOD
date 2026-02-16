@@ -294,6 +294,10 @@ ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')  # Web interface passwo
 SHOW_DUMMY_CHANNEL = os.getenv('SHOW_DUMMY_CHANNEL', 'true').lower() == 'true'  # Show info channel
 TMDB_API_KEY = os.getenv('TMDB_API_KEY', '')  # TMDb API key for metadata
 
+# Content limits (can be overridden via environment variables)
+MAX_MOVIES = int(os.getenv('MAX_MOVIES', '10000'))  # Maximum movies to return
+MAX_SHOWS = int(os.getenv('MAX_SHOWS', '5000'))     # Maximum TV shows to return
+
 # Configuration file path
 CONFIG_FILE = 'config.json'
 CATEGORIES_FILE = 'categories.json'
@@ -3167,7 +3171,7 @@ def player_api():
         # Handle "All Movies" category (category_id = "0")
         if category_id == "0" or not category_id:
             # No category specified or "All" - return all movies (with limit)
-            max_limit = limit if limit > 0 else 500
+            max_limit = limit if limit > 0 else MAX_MOVIES  # Use environment variable
             count = 0
             
             sections = get_cached_sections()
@@ -3304,7 +3308,7 @@ def player_api():
         # Handle "All Series" category (category_id = "0")
         if category_id == "0" or not category_id:
             # No category specified or "All" - return all series (with limit)
-            max_limit = limit if limit > 0 else 300
+            max_limit = limit if limit > 0 else MAX_SHOWS
             print(f"[DEBUG] Returning all series from all sections (max {max_limit})")
             count = 0
             
@@ -3366,7 +3370,7 @@ def player_api():
         else:
             # No category specified - return all series (with optional limit)
             # Default to 300 max to prevent timeout
-            max_limit = limit if limit > 0 else 300
+            max_limit = limit if limit > 0 else MAX_SHOWS
             print(f"[DEBUG] Returning all series from all sections (max {max_limit})")
             count = 0
             
@@ -4458,6 +4462,8 @@ if __name__ == '__main__':
     print("  • Cached library sections (5-minute refresh)")
     print("  • Minimal response size for fast loading")
     print("  • Threaded request handling")
+    print(f"  • Max movies: {MAX_MOVIES}")
+    print(f"  • Max TV shows: {MAX_SHOWS}")
     
     # Start background auto-matcher (only if TMDb is configured)
     if TMDB_API_KEY and plex:
