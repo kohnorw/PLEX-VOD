@@ -298,10 +298,12 @@ TMDB_API_KEY = os.getenv('TMDB_API_KEY', '')  # TMDb API key for metadata
 MAX_MOVIES = int(os.getenv('MAX_MOVIES', '10000'))  # Maximum movies to return
 MAX_SHOWS = int(os.getenv('MAX_SHOWS', '5000'))     # Maximum TV shows to return
 
-# Configuration file path
-CONFIG_FILE = 'config.json'
-CATEGORIES_FILE = 'categories.json'
-ENCRYPTION_KEY_FILE = '.encryption_key'
+# Configuration file paths - all in data directory
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
+CATEGORIES_FILE = os.path.join(DATA_DIR, 'categories.json')
+ENCRYPTION_KEY_FILE = os.path.join(DATA_DIR, '.encryption_key')
+CACHE_FILE = os.path.join(DATA_DIR, 'tmdb_cache.json')
 
 # Initialize Plex connection
 plex = None
@@ -322,8 +324,8 @@ session_cache = {
     'sections_time': 0
 }
 
-# Cache file for persistence
-CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'tmdb_cache.json')
+# Metadata cache for faster loading
+# Simple in-memory cache (per-session, not saved to disk)
 
 def save_cache_to_disk():
     """Save TMDb cache to disk"""
