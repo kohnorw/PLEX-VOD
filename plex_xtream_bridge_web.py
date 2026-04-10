@@ -1145,6 +1145,123 @@ def get_series_for_category(category):
     
     return series
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Continue Watching / On Deck helpers
+# Category IDs 9000 (movies) and 9001 (series) are reserved for these.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ON_DECK_MOVIE_CAT_ID  = "9000"
+ON_DECK_SERIES_CAT_ID = "9001"
+ON_DECK_LIMIT         = int(os.getenv('ON_DECK_LIMIT', '50'))
+
+def get_on_deck_movies(limit=None):
+    """
+    Return in-progress movies from Plex's On Deck list, formatted for Xtream.
+
+    Plex's library.onDeck() returns a mixed list of episodes and movies that
+    have been partially watched. We filter to movies only and deduplicate by
+    ratingKey so the same title never appears twice (e.g. if it appears in
+    multiple library sections).
+    """
+    if not plex:
+        return []
+
+    max_items = limit or ON_DECK_LIMIT
+    movies    = []
+    seen      = set()
+
+    try:
+        for item in plex.library.onDeck():
+            if len(movies) >= max_items:
+                break
+
+            # onDeck() can return Movie or Episode objects
+            if item.type != 'movie':
+                continue
+
+            if item.ratingKey in seen:
+                continue
+            seen.add(item.ratingKey)
+
+            formatted = format_movie_for_xtream(item, ON_DECK_MOVIE_CAT_ID)
+            if formatted:
+                # Inject progress percentage so players that support it can
+                # render a progress bar (non-standard but harmless for others)
+                try:
+                    view_offset = getattr(item, 'viewOffset', 0) or 0
+                    duration    = getattr(item, 'duration',   0) or 0
+                    if duration > 0:
+                        formatted['progress']    = round(view_offset / duration * 100)
+                        formatted['view_offset'] = view_offset // 1000  # seconds
+                        formatted['duration_secs'] = duration // 1000
+                except Exception:
+                    pass
+
+                movies.append(formatted)
+
+        print(f"[ON_DECK] Returning {len(movies)} in-progress movies")
+    except Exception as e:
+        print(f"[ON_DECK] Error fetching on-deck movies: {e}")
+
+    return movies
+
+
+def get_on_deck_series(limit=None):
+    """
+    Return TV shows that have in-progress episodes from Plex's On Deck list.
+
+    Plex's onDeck() returns individual *episodes*, but the Xtream series
+    category works at the *show* level. We walk each episode back to its
+    parent show and deduplicate so each show appears at most once. The list
+    is ordered by most-recently-watched first (Plex already gives us this).
+    """
+    if not plex:
+        return []
+
+    max_items = limit or ON_DECK_LIMIT
+    series    = []
+    seen      = set()
+
+    try:
+        for item in plex.library.onDeck():
+            if len(series) >= max_items:
+                break
+
+            if item.type != 'episode':
+                continue
+
+            try:
+                show = item.show()
+            except Exception:
+                continue
+
+            if show.ratingKey in seen:
+                continue
+            seen.add(show.ratingKey)
+
+            formatted = format_series_for_xtream(show, ON_DECK_SERIES_CAT_ID)
+            if formatted:
+                # Attach the next-up episode details as bonus metadata
+                try:
+                    formatted['next_episode_title']  = item.title
+                    formatted['next_episode_season'] = item.seasonNumber
+                    formatted['next_episode_num']    = item.index
+                    view_offset = getattr(item, 'viewOffset', 0) or 0
+                    duration    = getattr(item, 'duration',   0) or 0
+                    if duration > 0:
+                        formatted['next_episode_progress'] = round(view_offset / duration * 100)
+                except Exception:
+                    pass
+
+                series.append(formatted)
+
+        print(f"[ON_DECK] Returning {len(series)} in-progress TV shows")
+    except Exception as e:
+        print(f"[ON_DECK] Error fetching on-deck series: {e}")
+
+    return series
+
+
 # Load config and connect on startup
 load_config()
 connect_plex()
@@ -3158,21 +3275,46 @@ def player_api():
     # Get VOD categories - Auto-generated from Plex libraries
     elif action == 'get_vod_categories':
         categories = []
-        
+
         if plex:
             try:
+                # ── Continue Watching (movies) ──────────────────────────────
+                # Only show the category when Plex actually has in-progress
+                # movies so the slot doesn't appear empty in the player.
+                try:
+                    on_deck_preview = plex.library.onDeck()
+                    has_movie_deck  = any(i.type == 'movie' for i in on_deck_preview)
+                except Exception:
+                    has_movie_deck = False
+
+                if has_movie_deck:
+                    categories.append({
+                        "category_id":   ON_DECK_MOVIE_CAT_ID,
+                        "category_name": "▶ Continue Watching",
+                        "parent_id": 0
+                    })
+
+                # ── Regular library sections ────────────────────────────────
                 sections = get_cached_sections()
                 for section in sections:
                     if section.type == 'movie':
-                        # Each movie library becomes a category
                         categories.append({
-                            "category_id": str(section.key),
+                            "category_id":   str(section.key),
                             "category_name": section.title,
                             "parent_id": 0
                         })
+
+                # ── Smart categories (genre, decade, collections) ───────────
+                for cat in get_smart_categories_for_movies():
+                    categories.append({
+                        "category_id":   cat['id'],
+                        "category_name": cat['name'],
+                        "parent_id": 0
+                    })
+
             except Exception as e:
                 print(f"[ERROR] Failed to get VOD categories: {e}")
-        
+
         return jsonify(categories)
     
     # Get VOD streams (movies)
@@ -3184,7 +3326,14 @@ def player_api():
         start_time = time.time()
         
         movies = []
-        
+
+        # ── Continue Watching (movies) ─────────────────────────────────────
+        if category_id == ON_DECK_MOVIE_CAT_ID:
+            movies = get_on_deck_movies(limit if limit > 0 else None)
+            elapsed = time.time() - start_time
+            print(f"[PERF] Returned {len(movies)} on-deck movies in {elapsed:.2f}s")
+            return jsonify(movies)
+
         # Handle "All Movies" category (category_id = "0")
         if category_id == "0" or not category_id:
             # No category specified or "All" - return all movies (with limit)
@@ -3310,21 +3459,44 @@ def player_api():
     # Get series categories - Auto-generated from Plex libraries
     elif action == 'get_series_categories':
         categories = []
-        
+
         if plex:
             try:
+                # ── Continue Watching (TV shows) ────────────────────────────
+                try:
+                    on_deck_preview  = plex.library.onDeck()
+                    has_episode_deck = any(i.type == 'episode' for i in on_deck_preview)
+                except Exception:
+                    has_episode_deck = False
+
+                if has_episode_deck:
+                    categories.append({
+                        "category_id":   ON_DECK_SERIES_CAT_ID,
+                        "category_name": "▶ Continue Watching",
+                        "parent_id": 0
+                    })
+
+                # ── Regular library sections ────────────────────────────────
                 sections = get_cached_sections()
                 for section in sections:
                     if section.type == 'show':
-                        # Each TV library becomes a category
                         categories.append({
-                            "category_id": str(section.key),
+                            "category_id":   str(section.key),
                             "category_name": section.title,
                             "parent_id": 0
                         })
+
+                # ── Smart categories ────────────────────────────────────────
+                for cat in get_smart_categories_for_series():
+                    categories.append({
+                        "category_id":   cat['id'],
+                        "category_name": cat['name'],
+                        "parent_id": 0
+                    })
+
             except Exception as e:
                 print(f"[ERROR] Failed to get series categories: {e}")
-        
+
         return jsonify(categories)
     
     # Get series
@@ -3336,7 +3508,14 @@ def player_api():
         start_time = time.time()
         
         series_list = []
-        
+
+        # ── Continue Watching (TV shows) ───────────────────────────────────
+        if category_id == ON_DECK_SERIES_CAT_ID:
+            series_list = get_on_deck_series(limit if limit > 0 else None)
+            elapsed = time.time() - start_time
+            print(f"[PERF] Returned {len(series_list)} on-deck series in {elapsed:.2f}s")
+            return jsonify(series_list)
+
         # Handle "All Series" category (category_id = "0")
         if category_id == "0" or not category_id:
             # No category specified or "All" - return all series (with limit)
@@ -4496,6 +4675,7 @@ if __name__ == '__main__':
     print("  • Threaded request handling")
     print(f"  • Max movies: {MAX_MOVIES}")
     print(f"  • Max TV shows: {MAX_SHOWS}")
+    print(f"  • Continue Watching limit: {ON_DECK_LIMIT}")
     
     # Start background auto-matcher (only if TMDb is configured)
     if TMDB_API_KEY and plex:
