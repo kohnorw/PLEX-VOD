@@ -1165,140 +1165,49 @@ UNWATCHED_MOVIE_CAT_ID  = "9002"
 UNWATCHED_SERIES_CAT_ID = "9003"
 ON_DECK_LIMIT           = int(os.getenv('ON_DECK_LIMIT', '50'))
 
-# Cache the home-user server list so we don't hit plex.tv on every request
-_household_servers_cache      = None
-_household_servers_cache_time = 0
-_HOUSEHOLD_CACHE_TTL          = 600  # 10 minutes
-_household_cache_lock         = threading.Lock()  # prevents concurrent rebuilds
-
-
-def _get_household_plex_servers():
-    """
-    Return a list of (username, PlexServer) tuples — one per Plex Home user.
-
-    Uses a threading lock to ensure only one thread builds the cache at a
-    time — without this, concurrent requests all miss the empty cache and
-    each start their own slow plex.tv round-trip simultaneously.
-
-    Connects directly to PLEX_URL rather than going through plex.tv relay
-    so each user's server connection is fast and local.
-    """
-    global _household_servers_cache, _household_servers_cache_time
-
-    if not plex:
-        return []
-
-    now = time.time()
-
-    # Fast path — return cached result without acquiring lock
-    if _household_servers_cache is not None and (now - _household_servers_cache_time) < _HOUSEHOLD_CACHE_TTL:
-        return _household_servers_cache
-
-    # Slow path — acquire lock so only one thread rebuilds
-    with _household_cache_lock:
-        # Re-check inside lock in case another thread just finished building
-        now = time.time()
-        if _household_servers_cache is not None and (now - _household_servers_cache_time) < _HOUSEHOLD_CACHE_TTL:
-            return _household_servers_cache
-
-        servers = [('admin', plex)]
-
-        try:
-            from plexapi.myplex import MyPlexAccount
-            account    = MyPlexAccount(token=PLEX_TOKEN)
-            home_users = [u for u in account.users() if getattr(u, 'home', False)]
-
-            print(f"[ON_DECK] Found {len(home_users)} Plex Home users to connect")
-
-            for user in home_users:
-                try:
-                    # switchHomeUser returns a new MyPlexAccount for that user.
-                    # We then get their auth token and connect directly to the
-                    # local server URL — faster than resource().connect() which
-                    # routes through plex.tv to find the server.
-                    user_account = account.switchHomeUser(user.title)
-                    user_token   = user_account.authToken
-                    user_server  = PlexServer(PLEX_URL, user_token)
-                    servers.append((user.title, user_server))
-                    print(f"[ON_DECK] Home user connected: {user.title}")
-                except Exception as e:
-                    # 401 = managed user token not yet resolved — suppress
-                    # the verbose HTML error body until this is fixed properly
-                    if '401' in str(e):
-                        pass  # TODO: resolve managed user local auth
-                    else:
-                        print(f"[ON_DECK] Could not connect '{user.title}': {e}")
-
-            print(f"[ON_DECK] Household cache built — users: {[u for u, _ in servers]}")
-
-        except Exception as e:
-            print(f"[ON_DECK] Could not enumerate home users (admin only): {e}")
-
-        _household_servers_cache      = servers
-        _household_servers_cache_time = time.time()
-
-    return _household_servers_cache
-
-
 def get_on_deck_movies(limit=None):
-    """
-    Return in-progress movies across ALL household users, merged and
-    deduplicated by ratingKey, ordered most-recently-watched first.
-
-    Each user's onDeck() is fetched with their own PlexServer context so
-    Plex returns their personal watch state.  If the same movie is in
-    progress for two users, the first occurrence wins (admin first, then
-    home users in account order) and a `watched_by` field records who.
-    """
+    """Return in-progress movies from Plex On Deck for the admin account."""
     if not plex:
         return []
 
     max_items = limit or ON_DECK_LIMIT
     movies    = []
     seen      = set()
-    all_items = []   # (item, username) across all users
 
-    for username, server in _get_household_plex_servers():
-        try:
-            for item in server.library.onDeck():
-                if item.type == 'movie':
-                    all_items.append((item, username))
-        except Exception as e:
-            print(f"[ON_DECK] Error fetching movies for '{username}': {e}")
+    try:
+        for item in plex.library.onDeck():
+            if len(movies) >= max_items:
+                break
+            if item.type != 'movie':
+                continue
+            if item.ratingKey in seen:
+                continue
+            seen.add(item.ratingKey)
 
-    for item, username in all_items:
-        if len(movies) >= max_items:
-            break
-        if item.ratingKey in seen:
-            continue
-        seen.add(item.ratingKey)
+            formatted = format_movie_for_xtream(item, ON_DECK_MOVIE_CAT_ID)
+            if formatted:
+                try:
+                    view_offset = getattr(item, 'viewOffset', 0) or 0
+                    duration    = getattr(item, 'duration',   0) or 0
+                    if duration > 0:
+                        formatted['progress']      = round(view_offset / duration * 100)
+                        formatted['view_offset']   = view_offset // 1000
+                        formatted['duration_secs'] = duration    // 1000
+                except Exception:
+                    pass
+                movies.append(formatted)
+    except Exception as e:
+        print(f"[ON_DECK] Error fetching movies: {e}")
 
-        formatted = format_movie_for_xtream(item, ON_DECK_MOVIE_CAT_ID)
-        if formatted:
-            try:
-                view_offset = getattr(item, 'viewOffset', 0) or 0
-                duration    = getattr(item, 'duration',   0) or 0
-                if duration > 0:
-                    formatted['progress']      = round(view_offset / duration * 100)
-                    formatted['view_offset']   = view_offset // 1000
-                    formatted['duration_secs'] = duration    // 1000
-                formatted['watched_by'] = username
-            except Exception:
-                pass
-            movies.append(formatted)
-
-    print(f"[ON_DECK] Returning {len(movies)} in-progress movies across {len(seen)} unique titles")
+    print(f"[ON_DECK] Returning {len(movies)} in-progress movies")
     return movies
 
 
 def get_on_deck_series(limit=None):
     """
-    Return TV shows with in-progress episodes across ALL household users.
-
-    onDeck() returns individual episodes; each is walked back to its parent
-    show and deduplicated at the show level so each series appears once.
-    next_episode_* metadata reflects whichever user is furthest along
-    (first-seen wins — admin first, then home users in account order).
+    Return TV shows with in-progress episodes from Plex On Deck.
+    onDeck() returns individual episodes; each is walked back to its
+    parent show and deduplicated so each series appears at most once.
     """
     if not plex:
         return []
@@ -1306,45 +1215,40 @@ def get_on_deck_series(limit=None):
     max_items = limit or ON_DECK_LIMIT
     series    = []
     seen      = set()
-    all_items = []   # (episode, username) across all users
 
-    for username, server in _get_household_plex_servers():
-        try:
-            for item in server.library.onDeck():
-                if item.type == 'episode':
-                    all_items.append((item, username))
-        except Exception as e:
-            print(f"[ON_DECK] Error fetching series for '{username}': {e}")
+    try:
+        for item in plex.library.onDeck():
+            if len(series) >= max_items:
+                break
+            if item.type != 'episode':
+                continue
 
-    for item, username in all_items:
-        if len(series) >= max_items:
-            break
-
-        try:
-            show = item.show()
-        except Exception:
-            continue
-
-        if show.ratingKey in seen:
-            continue
-        seen.add(show.ratingKey)
-
-        formatted = format_series_for_xtream(show, ON_DECK_SERIES_CAT_ID)
-        if formatted:
             try:
-                formatted['next_episode_title']    = item.title
-                formatted['next_episode_season']   = item.seasonNumber
-                formatted['next_episode_num']      = item.index
-                formatted['watched_by']            = username
-                view_offset = getattr(item, 'viewOffset', 0) or 0
-                duration    = getattr(item, 'duration',   0) or 0
-                if duration > 0:
-                    formatted['next_episode_progress'] = round(view_offset / duration * 100)
+                show = item.show()
             except Exception:
-                pass
-            series.append(formatted)
+                continue
 
-    print(f"[ON_DECK] Returning {len(series)} in-progress TV shows across all household users")
+            if show.ratingKey in seen:
+                continue
+            seen.add(show.ratingKey)
+
+            formatted = format_series_for_xtream(show, ON_DECK_SERIES_CAT_ID)
+            if formatted:
+                try:
+                    formatted['next_episode_title']  = item.title
+                    formatted['next_episode_season'] = item.seasonNumber
+                    formatted['next_episode_num']    = item.index
+                    view_offset = getattr(item, 'viewOffset', 0) or 0
+                    duration    = getattr(item, 'duration',   0) or 0
+                    if duration > 0:
+                        formatted['next_episode_progress'] = round(view_offset / duration * 100)
+                except Exception:
+                    pass
+                series.append(formatted)
+    except Exception as e:
+        print(f"[ON_DECK] Error fetching series: {e}")
+
+    print(f"[ON_DECK] Returning {len(series)} in-progress TV shows")
     return series
 
 
@@ -3777,13 +3681,9 @@ def player_api():
         if plex:
             try:
                 # ── Continue Watching (movies) ──────────────────────────────
-                # Only show when at least one household user has in-progress
-                # movies so the slot doesn't appear empty in the player.
                 try:
                     has_movie_deck = any(
-                        i.type == 'movie'
-                        for _, srv in _get_household_plex_servers()
-                        for i in srv.library.onDeck()
+                        i.type == 'movie' for i in plex.library.onDeck()
                     )
                 except Exception:
                     has_movie_deck = False
@@ -3989,9 +3889,7 @@ def player_api():
                 # ── Continue Watching (TV shows) ────────────────────────────
                 try:
                     has_episode_deck = any(
-                        i.type == 'episode'
-                        for _, srv in _get_household_plex_servers()
-                        for i in srv.library.onDeck()
+                        i.type == 'episode' for i in plex.library.onDeck()
                     )
                 except Exception:
                     has_episode_deck = False
