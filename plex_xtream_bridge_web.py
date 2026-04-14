@@ -1059,6 +1059,10 @@ def get_movies_for_category(category):
             # Use Plex's native recently added
             items = section.recentlyAdded(maxresults=category.get('limit', 50))
         
+        elif category['type'] == 'plex_unwatched':
+            # Movies never played — viewCount=0
+            items = section.search(unwatched=True, limit=category.get('limit', 200))
+        
         elif category['type'] == 'plex_genre':
             # Use Plex's genre filter
             items = section.search(genre=category['genre'], limit=category.get('limit', 200))
@@ -1110,6 +1114,10 @@ def get_series_for_category(category):
             # Use Plex's native recently added
             items = section.recentlyAdded(maxresults=category.get('limit', 50))
         
+        elif category['type'] == 'plex_unwatched':
+            # Shows with no episodes watched at all
+            items = section.search(unwatched=True, limit=category.get('limit', 200))
+        
         elif category['type'] == 'plex_genre':
             # Use Plex's genre filter
             items = section.search(genre=category['genre'], limit=category.get('limit', 200))
@@ -1151,9 +1159,11 @@ def get_series_for_category(category):
 # Category IDs 9000 (movies) and 9001 (series) are reserved for these.
 # ─────────────────────────────────────────────────────────────────────────────
 
-ON_DECK_MOVIE_CAT_ID  = "9000"
-ON_DECK_SERIES_CAT_ID = "9001"
-ON_DECK_LIMIT         = int(os.getenv('ON_DECK_LIMIT', '50'))
+ON_DECK_MOVIE_CAT_ID    = "9000"
+ON_DECK_SERIES_CAT_ID   = "9001"
+UNWATCHED_MOVIE_CAT_ID  = "9002"
+UNWATCHED_SERIES_CAT_ID = "9003"
+ON_DECK_LIMIT           = int(os.getenv('ON_DECK_LIMIT', '50'))
 
 # Cache the home-user server list so we don't hit plex.tv on every request
 _household_servers_cache      = None
@@ -3785,6 +3795,13 @@ def player_api():
                         "parent_id": 0
                     })
 
+                # ── Unwatched Movies ────────────────────────────────────────
+                categories.append({
+                    "category_id":   UNWATCHED_MOVIE_CAT_ID,
+                    "category_name": "🎬 Unwatched Movies",
+                    "parent_id": 0
+                })
+
                 # ── Regular library sections ────────────────────────────────
                 sections = get_cached_sections()
                 for section in sections:
@@ -3823,6 +3840,22 @@ def player_api():
             movies = get_on_deck_movies(limit if limit > 0 else None)
             elapsed = time.time() - start_time
             print(f"[PERF] Returned {len(movies)} on-deck movies in {elapsed:.2f}s")
+            return jsonify(movies)
+
+        # ── Unwatched Movies ───────────────────────────────────────────────
+        if category_id == UNWATCHED_MOVIE_CAT_ID:
+            try:
+                max_limit = limit if limit > 0 else MAX_MOVIES
+                for section in get_cached_sections():
+                    if section.type == 'movie':
+                        for movie in section.search(unwatched=True, limit=max_limit):
+                            formatted = format_movie_for_xtream(movie, UNWATCHED_MOVIE_CAT_ID)
+                            if formatted:
+                                movies.append(formatted)
+            except Exception as e:
+                print(f"[ERROR] Unwatched movies: {e}")
+            elapsed = time.time() - start_time
+            print(f"[PERF] Returned {len(movies)} unwatched movies in {elapsed:.2f}s")
             return jsonify(movies)
 
         # Handle "All Movies" category (category_id = "0")
@@ -3970,6 +4003,13 @@ def player_api():
                         "parent_id": 0
                     })
 
+                # ── Unwatched Shows ─────────────────────────────────────────
+                categories.append({
+                    "category_id":   UNWATCHED_SERIES_CAT_ID,
+                    "category_name": "📺 Unwatched Shows",
+                    "parent_id": 0
+                })
+
                 # ── Regular library sections ────────────────────────────────
                 sections = get_cached_sections()
                 for section in sections:
@@ -4008,6 +4048,22 @@ def player_api():
             series_list = get_on_deck_series(limit if limit > 0 else None)
             elapsed = time.time() - start_time
             print(f"[PERF] Returned {len(series_list)} on-deck series in {elapsed:.2f}s")
+            return jsonify(series_list)
+
+        # ── Unwatched Shows ────────────────────────────────────────────────
+        if category_id == UNWATCHED_SERIES_CAT_ID:
+            try:
+                max_limit = limit if limit > 0 else MAX_SHOWS
+                for section in get_cached_sections():
+                    if section.type == 'show':
+                        for show in section.search(unwatched=True, limit=max_limit):
+                            formatted = format_series_for_xtream(show, UNWATCHED_SERIES_CAT_ID)
+                            if formatted:
+                                series_list.append(formatted)
+            except Exception as e:
+                print(f"[ERROR] Unwatched series: {e}")
+            elapsed = time.time() - start_time
+            print(f"[PERF] Returned {len(series_list)} unwatched shows in {elapsed:.2f}s")
             return jsonify(series_list)
 
         # Handle "All Series" category (category_id = "0")
