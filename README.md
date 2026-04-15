@@ -297,6 +297,7 @@ MIT License - see [LICENSE](LICENSE) file
 - **Plex** - Amazing media server
 - **TMDb** - Movie/TV metadata and artwork
 - **PlexAPI** - Python library for Plex
+- Some code written by bigverm23
 
 ---
 
