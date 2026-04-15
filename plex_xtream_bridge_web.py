@@ -289,7 +289,7 @@ PLEX_TOKEN = os.getenv('PLEX_TOKEN', '')
 BRIDGE_USERNAME = os.getenv('BRIDGE_USERNAME', 'admin')
 BRIDGE_PASSWORD = os.getenv('BRIDGE_PASSWORD', 'admin')
 BRIDGE_HOST = os.getenv('BRIDGE_HOST', '0.0.0.0')
-BRIDGE_PORT = int(os.getenv('BRIDGE_PORT', '8080'))
+BRIDGE_PORT = int(os.getenv('BRIDGE_PORT', '9999'))
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')  # Web interface password
 SHOW_DUMMY_CHANNEL = os.getenv('SHOW_DUMMY_CHANNEL', 'true').lower() == 'true'  # Show info channel
 TMDB_API_KEY = os.getenv('TMDB_API_KEY', '')  # TMDb API key for metadata
@@ -304,6 +304,7 @@ CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
 CATEGORIES_FILE = os.path.join(DATA_DIR, 'categories.json')
 ENCRYPTION_KEY_FILE = os.path.join(DATA_DIR, '.encryption_key')
 CACHE_FILE = os.path.join(DATA_DIR, 'tmdb_cache.json')
+STATS_FILE = os.path.join(DATA_DIR, 'stats.json')
 
 # Initialize Plex connection
 plex = None
@@ -1058,6 +1059,10 @@ def get_movies_for_category(category):
             # Use Plex's native recently added
             items = section.recentlyAdded(maxresults=category.get('limit', 50))
         
+        elif category['type'] == 'plex_unwatched':
+            # Movies never played — viewCount=0
+            items = section.search(unwatched=True, limit=category.get('limit', 200))
+        
         elif category['type'] == 'plex_genre':
             # Use Plex's genre filter
             items = section.search(genre=category['genre'], limit=category.get('limit', 200))
@@ -1109,6 +1114,10 @@ def get_series_for_category(category):
             # Use Plex's native recently added
             items = section.recentlyAdded(maxresults=category.get('limit', 50))
         
+        elif category['type'] == 'plex_unwatched':
+            # Shows with no episodes watched at all
+            items = section.search(unwatched=True, limit=category.get('limit', 200))
+        
         elif category['type'] == 'plex_genre':
             # Use Plex's genre filter
             items = section.search(genre=category['genre'], limit=category.get('limit', 200))
@@ -1145,6 +1154,104 @@ def get_series_for_category(category):
     
     return series
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Continue Watching / On Deck  — household-aware
+# Category IDs 9000 (movies) and 9001 (series) are reserved for these.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ON_DECK_MOVIE_CAT_ID    = "9000"
+ON_DECK_SERIES_CAT_ID   = "9001"
+UNWATCHED_MOVIE_CAT_ID  = "9002"
+UNWATCHED_SERIES_CAT_ID = "9003"
+ON_DECK_LIMIT           = int(os.getenv('ON_DECK_LIMIT', '50'))
+
+def get_on_deck_movies(limit=None):
+    """Return in-progress movies from Plex On Deck for the admin account."""
+    if not plex:
+        return []
+
+    max_items = limit or ON_DECK_LIMIT
+    movies    = []
+    seen      = set()
+
+    try:
+        for item in plex.library.onDeck():
+            if len(movies) >= max_items:
+                break
+            if item.type != 'movie':
+                continue
+            if item.ratingKey in seen:
+                continue
+            seen.add(item.ratingKey)
+
+            formatted = format_movie_for_xtream(item, ON_DECK_MOVIE_CAT_ID)
+            if formatted:
+                try:
+                    view_offset = getattr(item, 'viewOffset', 0) or 0
+                    duration    = getattr(item, 'duration',   0) or 0
+                    if duration > 0:
+                        formatted['progress']      = round(view_offset / duration * 100)
+                        formatted['view_offset']   = view_offset // 1000
+                        formatted['duration_secs'] = duration    // 1000
+                except Exception:
+                    pass
+                movies.append(formatted)
+    except Exception as e:
+        print(f"[ON_DECK] Error fetching movies: {e}")
+
+    print(f"[ON_DECK] Returning {len(movies)} in-progress movies")
+    return movies
+
+
+def get_on_deck_series(limit=None):
+    """
+    Return TV shows with in-progress episodes from Plex On Deck.
+    onDeck() returns individual episodes; each is walked back to its
+    parent show and deduplicated so each series appears at most once.
+    """
+    if not plex:
+        return []
+
+    max_items = limit or ON_DECK_LIMIT
+    series    = []
+    seen      = set()
+
+    try:
+        for item in plex.library.onDeck():
+            if len(series) >= max_items:
+                break
+            if item.type != 'episode':
+                continue
+
+            try:
+                show = item.show()
+            except Exception:
+                continue
+
+            if show.ratingKey in seen:
+                continue
+            seen.add(show.ratingKey)
+
+            formatted = format_series_for_xtream(show, ON_DECK_SERIES_CAT_ID)
+            if formatted:
+                try:
+                    formatted['next_episode_title']  = item.title
+                    formatted['next_episode_season'] = item.seasonNumber
+                    formatted['next_episode_num']    = item.index
+                    view_offset = getattr(item, 'viewOffset', 0) or 0
+                    duration    = getattr(item, 'duration',   0) or 0
+                    if duration > 0:
+                        formatted['next_episode_progress'] = round(view_offset / duration * 100)
+                except Exception:
+                    pass
+                series.append(formatted)
+    except Exception as e:
+        print(f"[ON_DECK] Error fetching series: {e}")
+
+    print(f"[ON_DECK] Returning {len(series)} in-progress TV shows")
+    return series
+
+
 # Load config and connect on startup
 load_config()
 connect_plex()
@@ -1152,6 +1259,138 @@ connect_plex()
 # Session storage
 sessions = {}
 active_streams = {}  # Track active streaming sessions
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stats tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+_stats_lock = threading.Lock()
+
+bridge_stats = {
+    'start_time':        time.time(),
+    'total_requests':    0,
+    'requests_by_action': {},
+    'total_streams':     0,
+    'streams_by_type':   {},
+    'recent_activity':   [],
+    'tmdb_cache_hits':   0,
+    'tmdb_cache_misses': 0,
+}
+
+
+def _record_request(action, username):
+    """Record an API request in the in-memory stats."""
+    with _stats_lock:
+        bridge_stats['total_requests'] += 1
+        bridge_stats['requests_by_action'][action] = \
+            bridge_stats['requests_by_action'].get(action, 0) + 1
+
+        bridge_stats['recent_activity'].append({
+            'time':   datetime.now().strftime('%H:%M:%S'),
+            'action': action,
+            'user':   username or 'unknown'
+        })
+        # Keep only the last 50 events
+        if len(bridge_stats['recent_activity']) > 50:
+            bridge_stats['recent_activity'] = bridge_stats['recent_activity'][-50:]
+
+
+def _record_stream(stream_type, title=''):
+    """Record a stream start in stats."""
+    with _stats_lock:
+        bridge_stats['total_streams'] += 1
+        bridge_stats['streams_by_type'][stream_type] = \
+            bridge_stats['streams_by_type'].get(stream_type, 0) + 1
+
+
+def _record_tmdb_lookup(hit: bool):
+    """Record a TMDb cache hit or miss."""
+    with _stats_lock:
+        if hit:
+            bridge_stats['tmdb_cache_hits'] += 1
+        else:
+            bridge_stats['tmdb_cache_misses'] += 1
+
+
+def _get_uptime_str():
+    """Return a human-readable uptime string."""
+    secs = int(time.time() - bridge_stats['start_time'])
+    days, rem  = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    parts = []
+    if days:  parts.append(f"{days}d")
+    if hours: parts.append(f"{hours}h")
+    if mins:  parts.append(f"{mins}m")
+    parts.append(f"{secs}s")
+    return ' '.join(parts)
+
+
+def _get_live_stats():
+    """Assemble the full stats payload for the dashboard."""
+    cleanup_inactive_streams()
+
+    # TMDb cache sizes
+    cached_movies = len(session_cache.get('movies', {}))
+    cached_series = len(session_cache.get('series', {}))
+
+    # Library sizes (fast — uses cached sections where possible)
+    total_movies = 0
+    total_shows  = 0
+    try:
+        if plex:
+            for section in plex.library.sections():
+                if section.type == 'movie':
+                    total_movies += section.totalViewSize()
+                elif section.type == 'show':
+                    total_shows  += section.totalViewSize()
+    except Exception:
+        pass
+
+    # Active streams detail
+    active = []
+    for stream in active_streams.values():
+        try:
+            item = plex.fetchItem(int(stream['stream_id']))
+            title = item.title
+        except Exception:
+            title = f"ID {stream['stream_id']}"
+        active.append({
+            'user':       stream['username'],
+            'title':      title,
+            'type':       stream['stream_type'],
+            'started':    datetime.fromtimestamp(stream['started_at']).strftime('%H:%M:%S'),
+            'duration':   int((time.time() - stream['started_at']) / 60)
+        })
+
+    with _stats_lock:
+        hits   = bridge_stats['tmdb_cache_hits']
+        misses = bridge_stats['tmdb_cache_misses']
+        total_lookups = hits + misses
+        hit_rate = round(hits / total_lookups * 100) if total_lookups > 0 else None
+
+        return {
+            'uptime':            _get_uptime_str(),
+            'total_requests':    bridge_stats['total_requests'],
+            'requests_by_action': dict(sorted(
+                bridge_stats['requests_by_action'].items(),
+                key=lambda x: x[1], reverse=True
+            )),
+            'total_streams':     bridge_stats['total_streams'],
+            'streams_by_type':   bridge_stats['streams_by_type'],
+            'active_streams':    active,
+            'active_user_count': len(set(s['username'] for s in active_streams.values())),
+            'cached_movies':     cached_movies,
+            'cached_series':     cached_series,
+            'total_movies':      total_movies,
+            'total_shows':       total_shows,
+            'tmdb_enabled':      bool(TMDB_API_KEY),
+            'tmdb_cache_hits':   hits,
+            'tmdb_cache_misses': misses,
+            'tmdb_total_lookups': total_lookups,
+            'tmdb_hit_rate':     hit_rate,
+            'recent_activity':   list(reversed(bridge_stats['recent_activity'])),
+        }
 
 def authenticate(username, password):
     """Authenticate user credentials"""
@@ -1176,6 +1415,7 @@ def track_stream_start(username, stream_id, stream_type):
         'started_at': time.time(),
         'last_active': time.time()
     }
+    _record_stream(stream_type)
     cleanup_inactive_streams()
 
 def cleanup_inactive_streams():
@@ -1233,12 +1473,12 @@ def format_movie_for_xtream(movie, category_id=1, skip_tmdb=False):
         tmdb_data = None
         if TMDB_API_KEY and not skip_tmdb:
             cache_key = f"movie_{movie.ratingKey}"
-            
-            # Check cache first
+
             if cache_key in session_cache['movies']:
                 tmdb_data = session_cache['movies'][cache_key]
+                _record_tmdb_lookup(hit=True)
             else:
-                # Fetch and cache
+                _record_tmdb_lookup(hit=False)
                 tmdb_data = enhance_movie_with_tmdb(movie)
                 if tmdb_data:
                     session_cache['movies'][cache_key] = tmdb_data
@@ -1302,12 +1542,12 @@ def format_series_for_xtream(show, category_id=2):
         tmdb_data = None
         if TMDB_API_KEY:
             cache_key = f"series_{show.ratingKey}"
-            
-            # Check cache first
+
             if cache_key in session_cache['series']:
                 tmdb_data = session_cache['series'][cache_key]
+                _record_tmdb_lookup(hit=True)
             else:
-                # Fetch and cache
+                _record_tmdb_lookup(hit=False)
                 tmdb_data = enhance_series_with_tmdb(show)
                 if tmdb_data:
                     session_cache['series'][cache_key] = tmdb_data
@@ -1684,6 +1924,7 @@ DASHBOARD_HTML = """
             
             <div class="action-buttons">
                 <a href="/admin/settings" class="button">⚙️ Settings</a>
+                <a href="/admin/stats" class="button">📊 Stats</a>
                 {% if tmdb_configured %}
                 <a href="/admin/match-tmdb" class="button">🎬 Match Unmatched Movies/Series</a>
                 {% endif %}
@@ -1962,6 +2203,268 @@ SETTINGS_HTML = """
             </div>
         </form>
     </div>
+</body>
+</html>
+"""
+
+STATS_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stats - Plex Xtream Bridge</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .card h1 { color: #333; margin-bottom: 5px; }
+        .card h2 { color: #333; margin-bottom: 20px; font-size: 18px; }
+        .subtitle { color: #666; margin-bottom: 20px; }
+        .stat-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 15px;
+            margin-bottom: 10px;
+        }
+        .stat-box {
+            background: #f8f9fa;
+            border-left: 4px solid #667eea;
+            border-radius: 8px;
+            padding: 18px;
+        }
+        .stat-box.green  { border-color: #28a745; }
+        .stat-box.orange { border-color: #fd7e14; }
+        .stat-box.red    { border-color: #dc3545; }
+        .stat-box.teal   { border-color: #20c997; }
+        .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #888; margin-bottom: 6px; }
+        .stat-value { font-size: 28px; font-weight: 700; color: #333; }
+        .stat-sub   { font-size: 12px; color: #999; margin-top: 4px; }
+        table { width: 100%; border-collapse: collapse; }
+        th { text-align: left; padding: 10px 12px; background: #f8f9fa; color: #555; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #e9ecef; }
+        td { padding: 10px 12px; border-bottom: 1px solid #f0f0f0; color: #444; font-size: 14px; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: #fafafa; }
+        .badge { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+        .badge-movie  { background: #cce5ff; color: #004085; }
+        .badge-series { background: #d4edda; color: #155724; }
+        .badge-episode { background: #d4edda; color: #155724; }
+        .bar-wrap { background: #e9ecef; border-radius: 4px; height: 8px; margin-top: 6px; }
+        .bar-fill { background: #667eea; border-radius: 4px; height: 8px; }
+        .button { display: inline-block; padding: 10px 20px; background: #667eea; color: white; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 14px; }
+        .button-secondary { background: #6c757d; }
+        .refresh-note { font-size: 12px; color: #999; float: right; margin-top: 4px; }
+        .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        @media (max-width: 700px) { .two-col { grid-template-columns: 1fr; } }
+        .empty { color: #aaa; font-style: italic; padding: 20px 0; text-align: center; }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <div class="card">
+        <h1>📊 Bridge Stats</h1>
+        <p class="subtitle">Live statistics — auto-refreshes every 10 seconds</p>
+        <a href="/admin" class="button button-secondary">← Dashboard</a>
+        <span class="refresh-note" id="last-refresh">Refreshing...</span>
+    </div>
+
+    <!-- Key numbers -->
+    <div class="card">
+        <h2>Overview</h2>
+        <div class="stat-grid" id="overview-grid">
+            <div class="stat-box green">
+                <div class="stat-label">Uptime</div>
+                <div class="stat-value" id="s-uptime">{{ uptime }}</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Total API Requests</div>
+                <div class="stat-value" id="s-requests">{{ total_requests }}</div>
+            </div>
+            <div class="stat-box orange">
+                <div class="stat-label">Total Streams Started</div>
+                <div class="stat-value" id="s-streams">{{ total_streams }}</div>
+                <div class="stat-sub">
+                    {% for stype, count in streams_by_type.items() %}
+                    {{ stype }}: {{ count }}{% if not loop.last %} · {% endif %}
+                    {% endfor %}
+                </div>
+            </div>
+            <div class="stat-box teal">
+                <div class="stat-label">Active Viewers</div>
+                <div class="stat-value" id="s-active">{{ active_user_count }}</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Movies in Library</div>
+                <div class="stat-value">{{ total_movies }}</div>
+                <div class="stat-sub">{{ cached_movies }} TMDb cached</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Shows in Library</div>
+                <div class="stat-value">{{ total_shows }}</div>
+                <div class="stat-sub">{{ cached_series }} TMDb cached</div>
+            </div>
+            <div class="stat-box {% if tmdb_hit_rate is not none %}{% if tmdb_hit_rate >= 80 %}green{% elif tmdb_hit_rate >= 50 %}orange{% else %}red{% endif %}{% endif %}">
+                <div class="stat-label">TMDb Cache Hit Rate</div>
+                <div class="stat-value" id="s-hitrate">
+                    {% if tmdb_hit_rate is not none %}{{ tmdb_hit_rate }}%{% else %}—{% endif %}
+                </div>
+                <div class="stat-sub" id="s-hitrate-sub">
+                    {% if tmdb_total_lookups > 0 %}
+                    {{ tmdb_cache_hits }} hits · {{ tmdb_cache_misses }} misses · {{ tmdb_total_lookups }} total
+                    {% else %}
+                    No lookups yet
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="two-col">
+        <!-- Active streams -->
+        <div class="card">
+            <h2>▶ Active Streams</h2>
+            <div id="active-streams-table">
+            {% if active_streams %}
+            <table>
+                <tr><th>User</th><th>Title</th><th>Type</th><th>Duration</th></tr>
+                {% for s in active_streams %}
+                <tr>
+                    <td>{{ s.user }}</td>
+                    <td>{{ s.title }}</td>
+                    <td><span class="badge badge-{{ s.type }}">{{ s.type }}</span></td>
+                    <td>{{ s.duration }}m</td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% else %}
+            <div class="empty">No active streams</div>
+            {% endif %}
+            </div>
+        </div>
+
+        <!-- Recent activity -->
+        <div class="card">
+            <h2>🕐 Recent Activity</h2>
+            <div id="recent-activity-table">
+            {% if recent_activity %}
+            <table>
+                <tr><th>Time</th><th>Action</th><th>User</th></tr>
+                {% for ev in recent_activity[:15] %}
+                <tr>
+                    <td style="font-family:monospace;font-size:12px;">{{ ev.time }}</td>
+                    <td style="font-size:12px;">{{ ev.action }}</td>
+                    <td style="font-size:12px;">{{ ev.user }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% else %}
+            <div class="empty">No activity yet</div>
+            {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Requests by action -->
+    <div class="card">
+        <h2>📡 Requests by Action</h2>
+        {% if requests_by_action %}
+        {% set max_count = requests_by_action.values() | max %}
+        <table>
+            <tr><th>Action</th><th>Count</th><th style="width:40%">Share</th></tr>
+            {% for action, count in requests_by_action.items() %}
+            <tr>
+                <td style="font-family:monospace;font-size:13px;">{{ action }}</td>
+                <td>{{ count }}</td>
+                <td>
+                    <div class="bar-wrap">
+                        <div class="bar-fill" style="width:{{ (count / max_count * 100) | int }}%"></div>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <div class="empty">No requests recorded yet</div>
+        {% endif %}
+    </div>
+
+</div>
+
+<script>
+function refreshStats() {
+    fetch('/admin/stats/data')
+        .then(r => r.json())
+        .then(d => {
+            document.getElementById('s-uptime').textContent   = d.uptime;
+            document.getElementById('s-requests').textContent = d.total_requests;
+            document.getElementById('s-streams').textContent  = d.total_streams;
+            document.getElementById('s-active').textContent   = d.active_user_count;
+
+            // TMDb hit rate
+            const hr    = document.getElementById('s-hitrate');
+            const hrSub = document.getElementById('s-hitrate-sub');
+            if (d.tmdb_hit_rate !== null) {
+                hr.textContent    = d.tmdb_hit_rate + '%';
+                hrSub.textContent = `${d.tmdb_cache_hits} hits · ${d.tmdb_cache_misses} misses · ${d.tmdb_total_lookups} total`;
+                const box = hr.closest('.stat-box');
+                box.classList.remove('green', 'orange', 'red');
+                box.classList.add(d.tmdb_hit_rate >= 80 ? 'green' : d.tmdb_hit_rate >= 50 ? 'orange' : 'red');
+            } else {
+                hr.textContent    = '—';
+                hrSub.textContent = 'No lookups yet';
+            }
+
+            // Active streams table
+            const at = document.getElementById('active-streams-table');
+            if (d.active_streams.length === 0) {
+                at.innerHTML = '<div class="empty">No active streams</div>';
+            } else {
+                at.innerHTML = '<table><tr><th>User</th><th>Title</th><th>Type</th><th>Duration</th></tr>' +
+                    d.active_streams.map(s =>
+                        `<tr><td>${s.user}</td><td>${s.title}</td>` +
+                        `<td><span class="badge badge-${s.type}">${s.type}</span></td>` +
+                        `<td>${s.duration}m</td></tr>`
+                    ).join('') + '</table>';
+            }
+
+            // Recent activity
+            const ra = document.getElementById('recent-activity-table');
+            if (d.recent_activity.length === 0) {
+                ra.innerHTML = '<div class="empty">No activity yet</div>';
+            } else {
+                ra.innerHTML = '<table><tr><th>Time</th><th>Action</th><th>User</th></tr>' +
+                    d.recent_activity.slice(0, 15).map(e =>
+                        `<tr><td style="font-family:monospace;font-size:12px;">${e.time}</td>` +
+                        `<td style="font-size:12px;">${e.action}</td>` +
+                        `<td style="font-size:12px;">${e.user}</td></tr>`
+                    ).join('') + '</table>';
+            }
+
+            document.getElementById('last-refresh').textContent =
+                'Last refresh: ' + new Date().toLocaleTimeString();
+        })
+        .catch(() => {
+            document.getElementById('last-refresh').textContent = 'Refresh failed';
+        });
+}
+
+// Refresh every 10 seconds
+setInterval(refreshStats, 10000);
+refreshStats();
+</script>
 </body>
 </html>
 """
@@ -2452,6 +2955,21 @@ def create_custom_category():
     except Exception as e:
         print(f"Error creating category: {e}")
         return redirect(url_for('category_editor'))
+
+@app.route('/admin/stats/data')
+@require_admin_login
+def stats_data():
+    """JSON endpoint for live stats — polled by the dashboard every 10s."""
+    return jsonify(_get_live_stats())
+
+
+@app.route('/admin/stats')
+@require_admin_login
+def admin_stats():
+    """Stats dashboard page."""
+    stats = _get_live_stats()
+    return render_template_string(STATS_HTML, **stats)
+
 
 @app.route('/admin/logout')
 def admin_logout():
@@ -3117,6 +3635,7 @@ def player_api():
     # Log the request (helpful for debugging)
     if action:
         print(f"[API] Request: action={action}, user={username}")
+        _record_request(action, username)
     
     if not validate_session():
         return jsonify({
@@ -3158,21 +3677,52 @@ def player_api():
     # Get VOD categories - Auto-generated from Plex libraries
     elif action == 'get_vod_categories':
         categories = []
-        
+
         if plex:
             try:
+                # ── Continue Watching (movies) ──────────────────────────────
+                try:
+                    has_movie_deck = any(
+                        i.type == 'movie' for i in plex.library.onDeck()
+                    )
+                except Exception:
+                    has_movie_deck = False
+
+                if has_movie_deck:
+                    categories.append({
+                        "category_id":   ON_DECK_MOVIE_CAT_ID,
+                        "category_name": "▶ Continue Watching",
+                        "parent_id": 0
+                    })
+
+                # ── Unwatched Movies ────────────────────────────────────────
+                categories.append({
+                    "category_id":   UNWATCHED_MOVIE_CAT_ID,
+                    "category_name": "🎬 Unwatched Movies",
+                    "parent_id": 0
+                })
+
+                # ── Regular library sections ────────────────────────────────
                 sections = get_cached_sections()
                 for section in sections:
                     if section.type == 'movie':
-                        # Each movie library becomes a category
                         categories.append({
-                            "category_id": str(section.key),
+                            "category_id":   str(section.key),
                             "category_name": section.title,
                             "parent_id": 0
                         })
+
+                # ── Smart categories (genre, decade, collections) ───────────
+                for cat in get_smart_categories_for_movies():
+                    categories.append({
+                        "category_id":   cat['id'],
+                        "category_name": cat['name'],
+                        "parent_id": 0
+                    })
+
             except Exception as e:
                 print(f"[ERROR] Failed to get VOD categories: {e}")
-        
+
         return jsonify(categories)
     
     # Get VOD streams (movies)
@@ -3184,7 +3734,30 @@ def player_api():
         start_time = time.time()
         
         movies = []
-        
+
+        # ── Continue Watching (movies) ─────────────────────────────────────
+        if category_id == ON_DECK_MOVIE_CAT_ID:
+            movies = get_on_deck_movies(limit if limit > 0 else None)
+            elapsed = time.time() - start_time
+            print(f"[PERF] Returned {len(movies)} on-deck movies in {elapsed:.2f}s")
+            return jsonify(movies)
+
+        # ── Unwatched Movies ───────────────────────────────────────────────
+        if category_id == UNWATCHED_MOVIE_CAT_ID:
+            try:
+                max_limit = limit if limit > 0 else MAX_MOVIES
+                for section in get_cached_sections():
+                    if section.type == 'movie':
+                        for movie in section.search(unwatched=True, limit=max_limit):
+                            formatted = format_movie_for_xtream(movie, UNWATCHED_MOVIE_CAT_ID)
+                            if formatted:
+                                movies.append(formatted)
+            except Exception as e:
+                print(f"[ERROR] Unwatched movies: {e}")
+            elapsed = time.time() - start_time
+            print(f"[PERF] Returned {len(movies)} unwatched movies in {elapsed:.2f}s")
+            return jsonify(movies)
+
         # Handle "All Movies" category (category_id = "0")
         if category_id == "0" or not category_id:
             # No category specified or "All" - return all movies (with limit)
@@ -3310,21 +3883,52 @@ def player_api():
     # Get series categories - Auto-generated from Plex libraries
     elif action == 'get_series_categories':
         categories = []
-        
+
         if plex:
             try:
+                # ── Continue Watching (TV shows) ────────────────────────────
+                try:
+                    has_episode_deck = any(
+                        i.type == 'episode' for i in plex.library.onDeck()
+                    )
+                except Exception:
+                    has_episode_deck = False
+
+                if has_episode_deck:
+                    categories.append({
+                        "category_id":   ON_DECK_SERIES_CAT_ID,
+                        "category_name": "▶ Continue Watching",
+                        "parent_id": 0
+                    })
+
+                # ── Unwatched Shows ─────────────────────────────────────────
+                categories.append({
+                    "category_id":   UNWATCHED_SERIES_CAT_ID,
+                    "category_name": "📺 Unwatched Shows",
+                    "parent_id": 0
+                })
+
+                # ── Regular library sections ────────────────────────────────
                 sections = get_cached_sections()
                 for section in sections:
                     if section.type == 'show':
-                        # Each TV library becomes a category
                         categories.append({
-                            "category_id": str(section.key),
+                            "category_id":   str(section.key),
                             "category_name": section.title,
                             "parent_id": 0
                         })
+
+                # ── Smart categories ────────────────────────────────────────
+                for cat in get_smart_categories_for_series():
+                    categories.append({
+                        "category_id":   cat['id'],
+                        "category_name": cat['name'],
+                        "parent_id": 0
+                    })
+
             except Exception as e:
                 print(f"[ERROR] Failed to get series categories: {e}")
-        
+
         return jsonify(categories)
     
     # Get series
@@ -3336,7 +3940,30 @@ def player_api():
         start_time = time.time()
         
         series_list = []
-        
+
+        # ── Continue Watching (TV shows) ───────────────────────────────────
+        if category_id == ON_DECK_SERIES_CAT_ID:
+            series_list = get_on_deck_series(limit if limit > 0 else None)
+            elapsed = time.time() - start_time
+            print(f"[PERF] Returned {len(series_list)} on-deck series in {elapsed:.2f}s")
+            return jsonify(series_list)
+
+        # ── Unwatched Shows ────────────────────────────────────────────────
+        if category_id == UNWATCHED_SERIES_CAT_ID:
+            try:
+                max_limit = limit if limit > 0 else MAX_SHOWS
+                for section in get_cached_sections():
+                    if section.type == 'show':
+                        for show in section.search(unwatched=True, limit=max_limit):
+                            formatted = format_series_for_xtream(show, UNWATCHED_SERIES_CAT_ID)
+                            if formatted:
+                                series_list.append(formatted)
+            except Exception as e:
+                print(f"[ERROR] Unwatched series: {e}")
+            elapsed = time.time() - start_time
+            print(f"[PERF] Returned {len(series_list)} unwatched shows in {elapsed:.2f}s")
+            return jsonify(series_list)
+
         # Handle "All Series" category (category_id = "0")
         if category_id == "0" or not category_id:
             # No category specified or "All" - return all series (with limit)
