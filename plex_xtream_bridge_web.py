@@ -303,8 +303,9 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
 CATEGORIES_FILE = os.path.join(DATA_DIR, 'categories.json')
 ENCRYPTION_KEY_FILE = os.path.join(DATA_DIR, '.encryption_key')
-CACHE_FILE = os.path.join(DATA_DIR, 'tmdb_cache.json')
-STATS_FILE = os.path.join(DATA_DIR, 'stats.json')
+CACHE_FILE            = os.path.join(DATA_DIR, 'tmdb_cache.json')
+STATS_FILE            = os.path.join(DATA_DIR, 'stats.json')
+CATEGORY_FILTERS_FILE = os.path.join(DATA_DIR, 'category_filters.json')
 
 # Initialize Plex connection
 plex = None
@@ -851,6 +852,125 @@ def save_categories():
         print(f"✗ Error saving categories: {e}")
         return False
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Special category ID constants — defined here so both the category filter
+# system and the On Deck functions can reference them without ordering issues
+# ─────────────────────────────────────────────────────────────────────────────
+
+ON_DECK_MOVIE_CAT_ID    = "9000"
+ON_DECK_SERIES_CAT_ID   = "9001"
+UNWATCHED_MOVIE_CAT_ID  = "9002"
+UNWATCHED_SERIES_CAT_ID = "9003"
+ON_DECK_LIMIT           = int(os.getenv('ON_DECK_LIMIT', '50'))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Category filters — opt-in per-category visibility control
+# ─────────────────────────────────────────────────────────────────────────────
+
+# In-memory filter state. Structure:
+#   { 'movies': { 'special': {'9000': True/False, ...},
+#                 'smart':   {'10001': True/False, ...} },
+#     'series': { 'special': {'9001': True/False, ...},
+#                 'smart':   {'20001': True/False, ...} } }
+category_filters = {
+    'movies': {'special': {}, 'smart': {}},
+    'series': {'special': {}, 'smart': {}}
+}
+
+# IDs for the special (non-smart) categories
+SPECIAL_CATEGORY_DEFS = {
+    'movies': [
+        {'id': ON_DECK_MOVIE_CAT_ID,   'name': '▶ Continue Watching'},
+        {'id': UNWATCHED_MOVIE_CAT_ID, 'name': '🎬 Unwatched Movies'},
+    ],
+    'series': [
+        {'id': ON_DECK_SERIES_CAT_ID,   'name': '▶ Continue Watching'},
+        {'id': UNWATCHED_SERIES_CAT_ID, 'name': '📺 Unwatched Shows'},
+    ],
+}
+
+
+def load_category_filters():
+    """Load saved category filter state from disk."""
+    global category_filters
+    try:
+        if os.path.exists(CATEGORY_FILTERS_FILE):
+            with open(CATEGORY_FILTERS_FILE, 'r') as f:
+                saved = json.load(f)
+            # Merge saved state — only update keys that exist in saved
+            for media_type in ('movies', 'series'):
+                for bucket in ('special', 'smart'):
+                    if media_type in saved and bucket in saved[media_type]:
+                        category_filters[media_type][bucket].update(
+                            saved[media_type][bucket]
+                        )
+            print(f"✓ Category filters loaded from disk")
+        else:
+            print("✓ No category filters file — all categories hidden by default (opt-in)")
+    except Exception as e:
+        print(f"✗ Error loading category filters: {e}")
+
+
+def save_category_filters():
+    """Persist current category filter state to disk."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(CATEGORY_FILTERS_FILE, 'w') as f:
+            json.dump(category_filters, f, indent=2)
+        print("✓ Category filters saved")
+        return True
+    except Exception as e:
+        print(f"✗ Error saving category filters: {e}")
+        return False
+
+
+def is_category_enabled(cat_id, media_type):
+    """
+    Return True if the given category ID is enabled for the given media type.
+    Opt-in: any ID not explicitly set to True is treated as hidden.
+    """
+    cat_id = str(cat_id)
+    # Check special bucket first, then smart
+    special = category_filters.get(media_type, {}).get('special', {})
+    smart   = category_filters.get(media_type, {}).get('smart', {})
+    if cat_id in special:
+        return special[cat_id]
+    if cat_id in smart:
+        return smart[cat_id]
+    return False  # opt-in default — hidden until explicitly enabled
+
+
+def get_full_category_state():
+    """
+    Return the complete category list for both movies and series, each entry
+    annotated with its current enabled state.  Used by the UI.
+    """
+    result = {'movies': {'special': [], 'smart': []},
+              'series': {'special': [], 'smart': []}}
+
+    for media_type, fn in (('movies', get_smart_categories_for_movies),
+                           ('series', get_smart_categories_for_series)):
+        # Special categories
+        for cat in SPECIAL_CATEGORY_DEFS[media_type]:
+            result[media_type]['special'].append({
+                'id':      cat['id'],
+                'name':    cat['name'],
+                'enabled': is_category_enabled(cat['id'], media_type),
+            })
+
+        # Smart categories (genres, decades, collections, recently added)
+        try:
+            for cat in fn():
+                result[media_type]['smart'].append({
+                    'id':      cat['id'],
+                    'name':    cat['name'],
+                    'enabled': is_category_enabled(cat['id'], media_type),
+                })
+        except Exception as e:
+            print(f"[CATEGORIES] Error building {media_type} smart list: {e}")
+
+    return result
+
 def connect_plex():
     """Connect to Plex server"""
     global plex
@@ -1155,15 +1275,8 @@ def get_series_for_category(category):
     return series
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Continue Watching / On Deck  — household-aware
-# Category IDs 9000 (movies) and 9001 (series) are reserved for these.
+# Continue Watching / On Deck
 # ─────────────────────────────────────────────────────────────────────────────
-
-ON_DECK_MOVIE_CAT_ID    = "9000"
-ON_DECK_SERIES_CAT_ID   = "9001"
-UNWATCHED_MOVIE_CAT_ID  = "9002"
-UNWATCHED_SERIES_CAT_ID = "9003"
-ON_DECK_LIMIT           = int(os.getenv('ON_DECK_LIMIT', '50'))
 
 def get_on_deck_movies(limit=None):
     """Return in-progress movies from Plex On Deck for the admin account."""
@@ -1255,6 +1368,7 @@ def get_on_deck_series(limit=None):
 # Load config and connect on startup
 load_config()
 connect_plex()
+load_category_filters()
 
 # Session storage
 sessions = {}
@@ -1925,6 +2039,7 @@ DASHBOARD_HTML = """
             <div class="action-buttons">
                 <a href="/admin/settings" class="button">⚙️ Settings</a>
                 <a href="/admin/stats" class="button">📊 Stats</a>
+                <a href="/admin/categories" class="button">📋 Categories</a>
                 {% if tmdb_configured %}
                 <a href="/admin/match-tmdb" class="button">🎬 Match Unmatched Movies/Series</a>
                 {% endif %}
@@ -2464,6 +2579,249 @@ function refreshStats() {
 // Refresh every 10 seconds
 setInterval(refreshStats, 10000);
 refreshStats();
+</script>
+</body>
+</html>
+"""
+
+CATEGORIES_FILTER_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Categories - Plex Xtream Bridge</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh; padding: 20px;
+        }
+        .container { max-width: 1100px; margin: 0 auto; }
+        .card {
+            background: white; padding: 25px; border-radius: 15px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.1); margin-bottom: 20px;
+        }
+        .card h1 { color: #333; margin-bottom: 5px; }
+        .card h2 { color: #333; margin-bottom: 15px; font-size: 18px; }
+        .subtitle { color: #666; margin-bottom: 20px; font-size: 14px; }
+        .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        @media (max-width: 750px) { .two-col { grid-template-columns: 1fr; } }
+        .section-header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 12px; padding-bottom: 10px;
+            border-bottom: 2px solid #f0f0f0;
+        }
+        .section-header h3 { color: #444; font-size: 15px; }
+        .select-links { font-size: 12px; }
+        .select-links a {
+            color: #667eea; text-decoration: none; cursor: pointer; margin-left: 8px;
+        }
+        .select-links a:hover { text-decoration: underline; }
+        .cat-list { max-height: 340px; overflow-y: auto; border: 1px solid #e9ecef; border-radius: 8px; }
+        .cat-item {
+            display: flex; align-items: center; gap: 10px;
+            padding: 9px 14px; border-bottom: 1px solid #f5f5f5;
+            transition: background 0.1s;
+        }
+        .cat-item:last-child { border-bottom: none; }
+        .cat-item:hover { background: #fafafa; }
+        .cat-item label {
+            flex: 1; font-size: 14px; color: #333; cursor: pointer;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .cat-item input[type=checkbox] { width: 16px; height: 16px; cursor: pointer; accent-color: #667eea; }
+        .badge-special {
+            font-size: 10px; background: #667eea; color: white;
+            padding: 2px 6px; border-radius: 8px; white-space: nowrap;
+        }
+        .badge-smart {
+            font-size: 10px; background: #e9ecef; color: #666;
+            padding: 2px 6px; border-radius: 8px; white-space: nowrap;
+        }
+        .count-pill {
+            font-size: 11px; color: #999; background: #f0f0f0;
+            padding: 2px 7px; border-radius: 10px; white-space: nowrap;
+        }
+        .info-box {
+            background: #e7f3ff; border-left: 4px solid #2196F3;
+            padding: 12px 15px; border-radius: 5px; margin-bottom: 18px;
+            font-size: 13px; color: #0c5460;
+        }
+        .alert { padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
+        .alert-success { background: #d4edda; color: #155724; border-left: 4px solid #28a745; }
+        .alert-error   { background: #f8d7da; color: #721c24; border-left: 4px solid #dc3545; }
+        .btn {
+            display: inline-block; padding: 11px 22px; border-radius: 8px;
+            font-weight: 600; border: none; cursor: pointer; font-size: 14px;
+            text-decoration: none; transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.88; }
+        .btn-primary { background: #667eea; color: white; }
+        .btn-secondary { background: #6c757d; color: white; }
+        .btn-success { background: #28a745; color: white; }
+        .footer-bar {
+            position: sticky; bottom: 0; background: white;
+            padding: 15px 25px; border-top: 1px solid #e9ecef;
+            display: flex; align-items: center; gap: 12px;
+            box-shadow: 0 -4px 12px rgba(0,0,0,0.06); border-radius: 0 0 15px 15px;
+        }
+        #save-msg { font-size: 13px; color: #666; }
+        .loading { text-align: center; padding: 40px; color: #aaa; font-size: 14px; }
+        .enabled-count { font-size: 13px; color: #667eea; font-weight: 600; }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <div class="card">
+        <h1>📋 Category Filters</h1>
+        <p class="subtitle">Choose which categories are relayed to your IPTV player. All categories are opt-in.</p>
+        <a href="/admin" class="btn btn-secondary" style="font-size:13px;padding:8px 16px;">← Dashboard</a>
+    </div>
+
+    <div id="alert-area"></div>
+
+    <div class="card">
+        <div class="info-box">
+            Check the categories you want visible in your player, then click <strong>Save Changes</strong>.
+            Unchecked categories will be hidden from your player completely.
+            Smart categories (genres, decades, collections) are discovered automatically from your library.
+        </div>
+
+        <div class="two-col" id="cat-grid">
+            <div class="loading">Loading categories…</div>
+        </div>
+
+        <div class="footer-bar">
+            <button class="btn btn-primary" onclick="saveChanges()">💾 Save Changes</button>
+            <button class="btn btn-secondary" onclick="location.reload()">↺ Reset</button>
+            <span id="save-msg"></span>
+        </div>
+    </div>
+
+</div>
+
+<script>
+let state = { movies: { special: [], smart: [] }, series: { special: [], smart: [] } };
+
+function buildSection(mediaType, label, icon) {
+    const data    = state[mediaType];
+    const allCats = [...data.special, ...data.smart];
+    const enabled = allCats.filter(c => c.enabled).length;
+
+    const specialRows = data.special.map(c => catRow(c, mediaType, 'special', 'special')).join('');
+    const smartRows   = data.smart.map(c =>   catRow(c, mediaType, 'smart',   'smart')).join('');
+
+    return `
+    <div>
+        <h2>${icon} ${label}</h2>
+        <p class="enabled-count" id="count-${mediaType}">${enabled} of ${allCats.length} enabled</p>
+
+        <div class="section-header" style="margin-top:14px;">
+            <h3>Special</h3>
+            <span class="select-links">
+                <a onclick="selectAll('${mediaType}','special')">All</a>
+                <a onclick="selectNone('${mediaType}','special')">None</a>
+            </span>
+        </div>
+        <div class="cat-list" id="list-${mediaType}-special">${specialRows}</div>
+
+        <div class="section-header" style="margin-top:18px;">
+            <h3>Smart <span class="count-pill">${data.smart.length}</span></h3>
+            <span class="select-links">
+                <a onclick="selectAll('${mediaType}','smart')">All</a>
+                <a onclick="selectNone('${mediaType}','smart')">None</a>
+            </span>
+        </div>
+        <div class="cat-list" id="list-${mediaType}-smart">${smartRows}</div>
+    </div>`;
+}
+
+function catRow(cat, mediaType, bucket, badgeType) {
+    const chk   = cat.enabled ? 'checked' : '';
+    const badge = badgeType === 'special'
+        ? '<span class="badge-special">special</span>'
+        : '<span class="badge-smart">smart</span>';
+    return `
+    <div class="cat-item">
+        <label>
+            <input type="checkbox" ${chk}
+                onchange="toggle('${mediaType}','${bucket}','${cat.id}',this.checked)">
+            ${cat.name}
+        </label>
+        ${badge}
+    </div>`;
+}
+
+function toggle(mediaType, bucket, id, enabled) {
+    const cat = state[mediaType][bucket].find(c => c.id === id);
+    if (cat) cat.enabled = enabled;
+    updateCount(mediaType);
+}
+
+function updateCount(mediaType) {
+    const all     = [...state[mediaType].special, ...state[mediaType].smart];
+    const enabled = all.filter(c => c.enabled).length;
+    const el      = document.getElementById('count-' + mediaType);
+    if (el) el.textContent = enabled + ' of ' + all.length + ' enabled';
+}
+
+function selectAll(mediaType, bucket) {
+    state[mediaType][bucket].forEach(c => c.enabled = true);
+    render(); 
+}
+
+function selectNone(mediaType, bucket) {
+    state[mediaType][bucket].forEach(c => c.enabled = false);
+    render();
+}
+
+function render() {
+    document.getElementById('cat-grid').innerHTML =
+        buildSection('movies', 'Movies', '🎬') +
+        buildSection('series', 'Series', '📺');
+}
+
+function showAlert(msg, type) {
+    document.getElementById('alert-area').innerHTML =
+        `<div class="card"><div class="alert alert-${type}">${msg}</div></div>`;
+    setTimeout(() => document.getElementById('alert-area').innerHTML = '', 4000);
+}
+
+function saveChanges() {
+    const msg = document.getElementById('save-msg');
+    msg.textContent = 'Saving…';
+    fetch('/admin/categories/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(state)
+    })
+    .then(r => r.json())
+    .then(d => {
+        if (d.success) {
+            msg.textContent = '✓ ' + d.message;
+            showAlert('✅ ' + d.message, 'success');
+        } else {
+            msg.textContent = '✗ Error';
+            showAlert('❌ ' + (d.error || 'Unknown error'), 'error');
+        }
+    })
+    .catch(e => {
+        msg.textContent = '✗ Error';
+        showAlert('❌ ' + e, 'error');
+    });
+}
+
+// Load on page open
+fetch('/admin/categories/data')
+    .then(r => r.json())
+    .then(d => { state = d; render(); })
+    .catch(() => {
+        document.getElementById('cat-grid').innerHTML =
+            '<div class="loading">Failed to load categories. Is Plex connected?</div>';
+    });
 </script>
 </body>
 </html>
@@ -3688,7 +4046,7 @@ def player_api():
                 except Exception:
                     has_movie_deck = False
 
-                if has_movie_deck:
+                if has_movie_deck and is_category_enabled(ON_DECK_MOVIE_CAT_ID, 'movies'):
                     categories.append({
                         "category_id":   ON_DECK_MOVIE_CAT_ID,
                         "category_name": "▶ Continue Watching",
@@ -3696,11 +4054,12 @@ def player_api():
                     })
 
                 # ── Unwatched Movies ────────────────────────────────────────
-                categories.append({
-                    "category_id":   UNWATCHED_MOVIE_CAT_ID,
-                    "category_name": "🎬 Unwatched Movies",
-                    "parent_id": 0
-                })
+                if is_category_enabled(UNWATCHED_MOVIE_CAT_ID, 'movies'):
+                    categories.append({
+                        "category_id":   UNWATCHED_MOVIE_CAT_ID,
+                        "category_name": "🎬 Unwatched Movies",
+                        "parent_id": 0
+                    })
 
                 # ── Regular library sections ────────────────────────────────
                 sections = get_cached_sections()
@@ -3714,11 +4073,12 @@ def player_api():
 
                 # ── Smart categories (genre, decade, collections) ───────────
                 for cat in get_smart_categories_for_movies():
-                    categories.append({
-                        "category_id":   cat['id'],
-                        "category_name": cat['name'],
-                        "parent_id": 0
-                    })
+                    if is_category_enabled(cat['id'], 'movies'):
+                        categories.append({
+                            "category_id":   cat['id'],
+                            "category_name": cat['name'],
+                            "parent_id": 0
+                        })
 
             except Exception as e:
                 print(f"[ERROR] Failed to get VOD categories: {e}")
@@ -3894,7 +4254,7 @@ def player_api():
                 except Exception:
                     has_episode_deck = False
 
-                if has_episode_deck:
+                if has_episode_deck and is_category_enabled(ON_DECK_SERIES_CAT_ID, 'series'):
                     categories.append({
                         "category_id":   ON_DECK_SERIES_CAT_ID,
                         "category_name": "▶ Continue Watching",
@@ -3902,11 +4262,12 @@ def player_api():
                     })
 
                 # ── Unwatched Shows ─────────────────────────────────────────
-                categories.append({
-                    "category_id":   UNWATCHED_SERIES_CAT_ID,
-                    "category_name": "📺 Unwatched Shows",
-                    "parent_id": 0
-                })
+                if is_category_enabled(UNWATCHED_SERIES_CAT_ID, 'series'):
+                    categories.append({
+                        "category_id":   UNWATCHED_SERIES_CAT_ID,
+                        "category_name": "📺 Unwatched Shows",
+                        "parent_id": 0
+                    })
 
                 # ── Regular library sections ────────────────────────────────
                 sections = get_cached_sections()
@@ -3920,11 +4281,12 @@ def player_api():
 
                 # ── Smart categories ────────────────────────────────────────
                 for cat in get_smart_categories_for_series():
-                    categories.append({
-                        "category_id":   cat['id'],
-                        "category_name": cat['name'],
-                        "parent_id": 0
-                    })
+                    if is_category_enabled(cat['id'], 'series'):
+                        categories.append({
+                            "category_id":   cat['id'],
+                            "category_name": cat['name'],
+                            "parent_id": 0
+                        })
 
             except Exception as e:
                 print(f"[ERROR] Failed to get series categories: {e}")
@@ -4789,291 +5151,57 @@ def view_category_contents(category_type, category_id):
 @app.route('/admin/categories')
 @require_admin_login
 def admin_categories():
-    """Categories disabled - redirect to dashboard"""
-    return redirect('/admin')
+    """Category filter management page."""
+    return render_template_string(CATEGORIES_FILTER_HTML)
 
-@app.route('/admin/categories/create', methods=['GET', 'POST'])
+
+@app.route('/admin/categories/data')
 @require_admin_login
-def create_category():
-    """Categories disabled - redirect to dashboard"""
-    return redirect('/admin')
+def categories_data():
+    """JSON endpoint — returns full category list with enabled state."""
+    return jsonify(get_full_category_state())
 
-@app.route('/admin/categories/<cat_id>/view')
+
+@app.route('/admin/categories/save', methods=['POST'])
 @require_admin_login
-def view_category(cat_id):
-    """Categories disabled - redirect to dashboard"""
-    return redirect('/admin')
+def categories_save():
+    """Save category filter selections from the UI."""
+    global category_filters
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'No data received'}), 400
 
-@app.route('/admin/categories/<cat_id>/delete', methods=['POST'])
-@require_admin_login
-def delete_category(cat_id):
-    """Categories disabled - redirect to dashboard"""
-    return redirect('/admin')
+        # Rebuild filters from submitted state
+        new_filters = {
+            'movies': {'special': {}, 'smart': {}},
+            'series': {'special': {}, 'smart': {}}
+        }
 
-# Original categories page function (disabled)
-def admin_categories_old():
-    """Categories management page"""
-    # Get smart categories
-    movie_smart = get_smart_categories_for_movies()
-    series_smart = get_smart_categories_for_series()
-    
-    # Get custom categories
-    movie_custom = custom_categories.get('movies', [])
-    series_custom = custom_categories.get('series', [])
-    
-    # Get Plex sections for creating new categories
-    plex_movie_sections = []
-    plex_tv_sections = []
-    
-    if plex:
-        plex_movie_sections = [{'id': s.key, 'name': s.title} for s in plex.library.sections() if s.type == 'movie']
-        plex_tv_sections = [{'id': s.key, 'name': s.title} for s in plex.library.sections() if s.type == 'show']
-    
-    categories_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Categories Management - Plex Xtream Bridge</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        
-        .card {
-            background: white;
-            padding: 30px;
-            border-radius: 15px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-            margin-bottom: 20px;
-        }
-        
-        .card h1, .card h2 {
-            color: #333;
-            margin-bottom: 15px;
-        }
-        
-        .button {
-            display: inline-block;
-            padding: 12px 24px;
-            background: #667eea;
-            color: white;
-            text-decoration: none;
-            border-radius: 8px;
-            font-weight: 600;
-            border: none;
-            cursor: pointer;
-            transition: background 0.3s;
-        }
-        
-        .button:hover {
-            background: #5568d3;
-        }
-        
-        .button-secondary {
-            background: #6c757d;
-        }
-        
-        .category-list {
-            display: grid;
-            gap: 10px;
-            margin-top: 15px;
-        }
-        
-        .category-item {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        
-        .category-info {
-            flex: 1;
-        }
-        
-        .category-name {
-            font-weight: 600;
-            color: #333;
-        }
-        
-        .category-badge {
-            background: #667eea;
-            color: white;
-            padding: 4px 10px;
-            border-radius: 12px;
-            font-size: 12px;
-            margin-left: 10px;
-        }
-        
-        .view-button {
-            padding: 8px 16px;
-            background: #28a745;
-            color: white;
-            text-decoration: none;
-            border-radius: 6px;
-            font-size: 13px;
-            font-weight: 600;
-            transition: background 0.2s;
-        }
-        
-        .view-button:hover {
-            background: #218838;
-        }
-        
-        .info-box {
-            background: #e7f3ff;
-            border-left: 4px solid #2196F3;
-            padding: 15px;
-            border-radius: 5px;
-            margin: 15px 0;
-        }
-        
-        .success-box {
-            background: #d4edda;
-            border-left: 4px solid #28a745;
-            padding: 15px;
-            border-radius: 5px;
-            margin: 15px 0;
-            color: #155724;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="card">
-            <h1>📚 Categories Management</h1>
-            <p style="color: #666; margin-bottom: 20px;">Manage your movie and TV show categories</p>
-            
-            <a href="/admin" class="button button-secondary">← Back to Dashboard</a>
-        </div>
-        
-        <div class="card">
-            <h2>🎬 Movie Categories</h2>
-            
-            <div class="info-box">
-                <strong>Auto-Generated Categories</strong><br>
-                These are automatically created from your Plex libraries and include Recently Added, Recently Released, Highly Rated, and Genre-based categories.
-            </div>
-            
-            <div class="category-list">
-                {% for cat in movie_smart %}
-                <div class="category-item">
-                    <div class="category-info">
-                        <span class="category-name">{{ cat.name }}</span>
-                        <span class="category-badge">Auto</span>
-                    </div>
-                    <a href="/admin/category/movie/{{ cat.id }}" class="view-button">👁️ View Contents</a>
-                </div>
-                {% endfor %}
-            </div>
-            
-            {% if movie_custom %}
-            <h3 style="margin-top: 30px;">Custom Categories</h3>
-            <div class="category-list">
-                {% for cat in movie_custom %}
-                <div class="category-item">
-                    <div class="category-info">
-                        <span class="category-name">{{ cat.name }}</span>
-                        <span class="category-badge" style="background: #28a745;">Custom</span>
-                    </div>
-                    <a href="/admin/category/movie/{{ cat.id }}" class="view-button">👁️ View Contents</a>
-                </div>
-                {% endfor %}
-            </div>
-            {% endif %}
-        </div>
-        
-        <div class="card">
-            <h2>📺 TV Show Categories</h2>
-            
-            <div class="info-box">
-                <strong>Auto-Generated Categories</strong><br>
-                These are automatically created from your Plex libraries and include Recently Added, Recently Aired, Highly Rated, and Genre-based categories.
-            </div>
-            
-            <div class="category-list">
-                {% for cat in series_smart %}
-                <div class="category-item">
-                    <div class="category-info">
-                        <span class="category-name">{{ cat.name }}</span>
-                        <span class="category-badge">Auto</span>
-                    </div>
-                    <a href="/admin/category/series/{{ cat.id }}" class="view-button">👁️ View Contents</a>
-                </div>
-                {% endfor %}
-            </div>
-            
-            {% if series_custom %}
-            <h3 style="margin-top: 30px;">Custom Categories</h3>
-            <div class="category-list">
-                {% for cat in series_custom %}
-                <div class="category-item">
-                    <div class="category-info">
-                        <span class="category-name">{{ cat.name }}</span>
-                        <span class="category-badge" style="background: #28a745;">Custom</span>
-                    </div>
-                    <a href="/admin/category/series/{{ cat.id }}" class="view-button">👁️ View Contents</a>
-                </div>
-                {% endfor %}
-            </div>
-            {% endif %}
-        </div>
-        
-        <div class="card">
-            <h2>ℹ️ About Categories</h2>
-            
-            <div class="success-box">
-                <strong>✅ Categories are now active!</strong><br>
-                Your Xtream UI player will show all these categories automatically. No need to do anything - just refresh your player app!
-            </div>
-            
-            <h3 style="margin-top: 20px;">What's Included:</h3>
-            <ul style="margin-left: 25px; margin-top: 10px; color: #666; line-height: 1.8;">
-                <li><strong>🆕 Recently Added</strong> - Your newest content (last 50 items)</li>
-                <li><strong>🎬 Recently Released</strong> - Content sorted by release date</li>
-                <li><strong>⭐ Highly Rated</strong> - Your best-rated content</li>
-                <li><strong>🎭 Genre Categories</strong> - Automatically created for each genre in your library</li>
-            </ul>
-            
-            <h3 style="margin-top: 20px;">Coming Soon:</h3>
-            <ul style="margin-left: 25px; margin-top: 10px; color: #666; line-height: 1.8;">
-                <li>Create custom categories with your own filters</li>
-                <li>TMDb integration for enhanced metadata</li>
-                <li>Year-based categories</li>
-                <li>Decade collections</li>
-                <li>Actor/Director based categories</li>
-            </ul>
-        </div>
-    </div>
-</body>
-</html>
-    """
-    
-    return render_template_string(categories_html,
-        movie_smart=movie_smart,
-        series_smart=series_smart,
-        movie_custom=movie_custom,
-        series_custom=series_custom,
-        plex_movie_sections=plex_movie_sections,
-        plex_tv_sections=plex_tv_sections
-    )
+        for media_type in ('movies', 'series'):
+            for bucket in ('special', 'smart'):
+                for item in data.get(media_type, {}).get(bucket, []):
+                    cat_id  = str(item.get('id', ''))
+                    enabled = bool(item.get('enabled', False))
+                    if cat_id:
+                        new_filters[media_type][bucket][cat_id] = enabled
+
+        category_filters = new_filters
+        save_category_filters()
+
+        movie_count  = sum(1 for v in new_filters['movies']['special'].values() if v)
+        movie_count += sum(1 for v in new_filters['movies']['smart'].values()   if v)
+        series_count  = sum(1 for v in new_filters['series']['special'].values() if v)
+        series_count += sum(1 for v in new_filters['series']['smart'].values()   if v)
+
+        return jsonify({
+            'success': True,
+            'message': f'Saved — {movie_count} movie and {series_count} series categories enabled'
+        })
+    except Exception as e:
+        print(f"[CATEGORIES] Error saving filters: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/')
 def index():
