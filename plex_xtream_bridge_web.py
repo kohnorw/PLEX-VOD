@@ -5,7 +5,6 @@ Allows Xtream UI players to access Plex library content with easy configuration
 """
 
 from flask import Flask, jsonify, request, Response, render_template_string, redirect, url_for, session
-from plexapi.server import PlexServer
 import requests
 import hashlib
 import time
@@ -24,85 +23,754 @@ from queue import Queue, Empty
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(32))
 
-# Background cache warming
+# ─────────────────────────────────────────────────────────────────────────────
+# PlexClient — raw HTTP interface to Plex Media Server
+# Replaces plexapi with direct requests calls for consistency with the
+# future Emby/Jellyfin abstraction layer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PlexClient:
+    """
+    Thin HTTP client for Plex Media Server.
+    All methods return normalized dicts so the rest of the app never
+    touches Plex-specific object types.
+    """
+
+    def __init__(self, url, token):
+        self.url         = url.rstrip('/')
+        self.token       = token
+        self.server_name = ''
+        self.machine_id  = ''
+        self._session    = requests.Session()
+        self._session.headers.update({
+            'X-Plex-Token':          token,
+            'X-Plex-Client-Identifier': 'plex-xtream-bridge',
+            'Accept':                'application/json',
+        })
+
+    # ── Connection ──────────────────────────────────────────────────────────
+
+    def connect(self):
+        """Test connection and populate server_name / machine_id."""
+        try:
+            r = self._get('/')
+            self.server_name = r.get('MediaContainer', {}).get('friendlyName', '')
+            self.machine_id  = r.get('MediaContainer', {}).get('machineIdentifier', '')
+            return True
+        except Exception as e:
+            print(f"[PLEX] Connection failed: {e}")
+            return False
+
+    def _get(self, path, params=None):
+        url = self.url + path
+        r   = self._session.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    # ── Libraries ───────────────────────────────────────────────────────────
+
+    def get_libraries(self):
+        """Return list of {'id', 'title', 'type'} dicts."""
+        data = self._get('/library/sections')
+        libs = []
+        for d in data.get('MediaContainer', {}).get('Directory', []):
+            libs.append({
+                'id':    d['key'],
+                'title': d['title'],
+                'type':  d['type'],   # 'movie' or 'show'
+            })
+        return libs
+
+    def total_view_size(self, lib_id, media_type='movie'):
+        """Return total item count for a library section."""
+        try:
+            plex_type = 1 if media_type == 'movie' else 2
+            data = self._get(f'/library/sections/{lib_id}/all',
+                             params={'type': plex_type, 'X-Plex-Container-Size': 0,
+                                     'X-Plex-Container-Start': 0})
+            return data.get('MediaContainer', {}).get('totalSize', 0)
+        except Exception:
+            return 0
+
+    # ── Items ────────────────────────────────────────────────────────────────
+
+    def _normalize_movie(self, d):
+        """Normalize a Plex Metadata dict to our common item format."""
+        media  = d.get('Media', [{}])[0]
+        part   = media.get('Part', [{}])[0]
+        genres = [g['tag'] for g in d.get('Genre', [])]
+        return {
+            'id':             str(d.get('ratingKey', '')),
+            'title':          d.get('title', ''),
+            'year':           d.get('year'),
+            'summary':        d.get('summary', ''),
+            'rating':         d.get('rating'),
+            'content_rating': d.get('contentRating', ''),
+            'thumb':          f"{self.url}{d['thumb']}?X-Plex-Token={self.token}" if d.get('thumb') else '',
+            'art':            f"{self.url}{d['art']}?X-Plex-Token={self.token}"   if d.get('art')   else '',
+            'genres':         genres,
+            'added_at':       d.get('addedAt', 0),
+            'duration':       d.get('duration', 0),
+            'view_offset':    d.get('viewOffset', 0),
+            'type':           'movie',
+            'media_parts':    [{'key': part.get('key', ''), 'container': part.get('container', 'mkv')}],
+            'directors':      [c['tag'] for c in d.get('Director', [])],
+            'roles':          [c['tag'] for c in d.get('Role', [])[:10]],
+            'original_title': d.get('originalTitle', d.get('title', '')),
+        }
+
+    def _normalize_show(self, d):
+        genres = [g['tag'] for g in d.get('Genre', [])]
+        return {
+            'id':          str(d.get('ratingKey', '')),
+            'title':       d.get('title', ''),
+            'year':        d.get('year'),
+            'summary':     d.get('summary', ''),
+            'rating':      d.get('rating'),
+            'thumb':       f"{self.url}{d['thumb']}?X-Plex-Token={self.token}" if d.get('thumb') else '',
+            'art':         f"{self.url}{d['art']}?X-Plex-Token={self.token}"   if d.get('art')   else '',
+            'genres':      genres,
+            'added_at':    d.get('addedAt', 0),
+            'duration':    d.get('duration', 0),
+            'type':        'show',
+            'directors':   [c['tag'] for c in d.get('Director', [])],
+            'roles':       [c['tag'] for c in d.get('Role', [])[:10]],
+        }
+
+    def _normalize_episode(self, d):
+        media = d.get('Media', [{}])[0]
+        part  = media.get('Part', [{}])[0]
+        return {
+            'id':             str(d.get('ratingKey', '')),
+            'title':          d.get('title', ''),
+            'summary':        d.get('summary', ''),
+            'rating':         d.get('rating'),
+            'thumb':          f"{self.url}{d['thumb']}?X-Plex-Token={self.token}" if d.get('thumb') else '',
+            'added_at':       d.get('addedAt', 0),
+            'duration':       d.get('duration', 0),
+            'view_offset':    d.get('viewOffset', 0),
+            'type':           'episode',
+            'season_number':  d.get('parentIndex'),
+            'episode_number': d.get('index'),
+            'air_date':       d.get('originallyAvailableAt', ''),
+            'media_parts':    [{'key': part.get('key', ''), 'container': part.get('container', 'mkv')}],
+            'show_id':        str(d.get('grandparentRatingKey', '')),
+        }
+
+    def _normalize_season(self, d):
+        return {
+            'id':            str(d.get('ratingKey', '')),
+            'title':         d.get('title', ''),
+            'summary':       d.get('summary', ''),
+            'season_number': d.get('index'),
+            'year':          d.get('year'),
+            'thumb':         f"{self.url}{d['thumb']}?X-Plex-Token={self.token}" if d.get('thumb') else '',
+            'art':           f"{self.url}{d['art']}?X-Plex-Token={self.token}"   if d.get('art')   else '',
+            'type':          'season',
+        }
+
+    def get_item(self, item_id):
+        """Fetch a single item by ID and return normalized dict."""
+        data  = self._get(f'/library/metadata/{item_id}')
+        items = data.get('MediaContainer', {}).get('Metadata', [])
+        if not items:
+            return None
+        d = items[0]
+        t = d.get('type', '')
+        if t == 'movie':   return self._normalize_movie(d)
+        if t == 'show':    return self._normalize_show(d)
+        if t == 'episode': return self._normalize_episode(d)
+        return d
+
+    def get_all_movies(self, lib_id, limit=None):
+        params = {'type': 1}
+        if limit:
+            params['X-Plex-Container-Size'] = limit
+        data = self._get(f'/library/sections/{lib_id}/all', params=params)
+        items = data.get('MediaContainer', {}).get('Metadata', [])
+        return [self._normalize_movie(d) for d in items]
+
+    def get_all_shows(self, lib_id, limit=None):
+        params = {'type': 2}
+        if limit:
+            params['X-Plex-Container-Size'] = limit
+        data = self._get(f'/library/sections/{lib_id}/all', params=params)
+        items = data.get('MediaContainer', {}).get('Metadata', [])
+        return [self._normalize_show(d) for d in items]
+
+    def get_recently_added(self, lib_id, limit=50):
+        data  = self._get(f'/library/sections/{lib_id}/recentlyAdded',
+                          params={'X-Plex-Container-Size': limit})
+        items = data.get('MediaContainer', {}).get('Metadata', [])
+        # recentlyAdded can return both movies and episodes
+        result = []
+        for d in items:
+            t = d.get('type', '')
+            if t == 'movie': result.append(self._normalize_movie(d))
+            elif t == 'show': result.append(self._normalize_show(d))
+        return result
+
+    def get_unwatched_movies(self, lib_id, limit=None):
+        params = {'type': 1, 'unwatched': 1}
+        if limit:
+            params['X-Plex-Container-Size'] = limit
+        data  = self._get(f'/library/sections/{lib_id}/all', params=params)
+        items = data.get('MediaContainer', {}).get('Metadata', [])
+        return [self._normalize_movie(d) for d in items]
+
+    def get_unwatched_shows(self, lib_id, limit=None):
+        params = {'type': 2, 'unwatched': 1}
+        if limit:
+            params['X-Plex-Container-Size'] = limit
+        data  = self._get(f'/library/sections/{lib_id}/all', params=params)
+        items = data.get('MediaContainer', {}).get('Metadata', [])
+        return [self._normalize_show(d) for d in items]
+
+    def get_by_genre(self, lib_id, genre, media_type='movie', limit=200):
+        plex_type = 1 if media_type == 'movie' else 2
+        data  = self._get(f'/library/sections/{lib_id}/all',
+                          params={'type': plex_type, 'genre': genre,
+                                  'X-Plex-Container-Size': limit})
+        items = data.get('MediaContainer', {}).get('Metadata', [])
+        if media_type == 'movie':
+            return [self._normalize_movie(d) for d in items]
+        return [self._normalize_show(d) for d in items]
+
+    def get_by_decade(self, lib_id, decade, media_type='movie', limit=200):
+        plex_type = 1 if media_type == 'movie' else 2
+        data  = self._get(f'/library/sections/{lib_id}/all',
+                          params={'type': plex_type,
+                                  'year>>': decade, 'year<<': decade + 9,
+                                  'X-Plex-Container-Size': limit})
+        items = data.get('MediaContainer', {}).get('Metadata', [])
+        if media_type == 'movie':
+            return [self._normalize_movie(d) for d in items]
+        return [self._normalize_show(d) for d in items]
+
+    def get_genres(self, lib_id, media_type='movie'):
+        """Return sorted list of genre strings for a library section."""
+        plex_type = 1 if media_type == 'movie' else 2
+        try:
+            # Sample up to 500 items to collect genres
+            data  = self._get(f'/library/sections/{lib_id}/all',
+                              params={'type': plex_type,
+                                      'X-Plex-Container-Size': 500})
+            items = data.get('MediaContainer', {}).get('Metadata', [])
+            genres = set()
+            for d in items:
+                for g in d.get('Genre', []):
+                    genres.add(g['tag'])
+            return sorted(genres)
+        except Exception as e:
+            print(f"[PLEX] Error getting genres: {e}")
+            return []
+
+    def get_decades(self, lib_id, media_type='movie'):
+        """Return sorted list of decade ints for a library section."""
+        plex_type = 1 if media_type == 'movie' else 2
+        try:
+            data  = self._get(f'/library/sections/{lib_id}/all',
+                              params={'type': plex_type,
+                                      'X-Plex-Container-Size': 500})
+            items = data.get('MediaContainer', {}).get('Metadata', [])
+            decades = set()
+            for d in items:
+                year = d.get('year')
+                if year:
+                    decade = (year // 10) * 10
+                    if decade >= 1920:
+                        decades.add(decade)
+            return sorted(decades, reverse=True)
+        except Exception as e:
+            print(f"[PLEX] Error getting decades: {e}")
+            return []
+
+    def get_collections(self, lib_id):
+        """Return list of {'id', 'title'} dicts."""
+        try:
+            data  = self._get(f'/library/sections/{lib_id}/collections')
+            items = data.get('MediaContainer', {}).get('Metadata', [])
+            return [{'id': str(d['ratingKey']), 'title': d['title']} for d in items]
+        except Exception as e:
+            print(f"[PLEX] Error getting collections: {e}")
+            return []
+
+    def get_collection_items(self, collection_id, media_type='movie'):
+        try:
+            data  = self._get(f'/library/metadata/{collection_id}/children')
+            items = data.get('MediaContainer', {}).get('Metadata', [])
+            if media_type == 'movie':
+                return [self._normalize_movie(d) for d in items]
+            return [self._normalize_show(d) for d in items]
+        except Exception as e:
+            print(f"[PLEX] Error getting collection items: {e}")
+            return []
+
+    def get_on_deck(self, limit=50):
+        """Return mixed list of normalized movie and episode dicts."""
+        data  = self._get('/library/onDeck',
+                          params={'X-Plex-Container-Size': limit * 2})
+        items = data.get('MediaContainer', {}).get('Metadata', [])
+        result = []
+        for d in items:
+            t = d.get('type', '')
+            if   t == 'movie':   result.append(self._normalize_movie(d))
+            elif t == 'episode': result.append(self._normalize_episode(d))
+        return result
+
+    def get_seasons(self, show_id):
+        data  = self._get(f'/library/metadata/{show_id}/children')
+        items = data.get('MediaContainer', {}).get('Metadata', [])
+        return [self._normalize_season(d) for d in items if d.get('type') == 'season']
+
+    def get_episodes(self, season_id):
+        data  = self._get(f'/library/metadata/{season_id}/children')
+        items = data.get('MediaContainer', {}).get('Metadata', [])
+        return [self._normalize_episode(d) for d in items if d.get('type') == 'episode']
+
+    def search(self, lib_id, query, media_type='movie', limit=20):
+        plex_type = 1 if media_type == 'movie' else 2
+        data  = self._get(f'/library/sections/{lib_id}/all',
+                          params={'type': plex_type, 'title': query,
+                                  'X-Plex-Container-Size': limit})
+        items = data.get('MediaContainer', {}).get('Metadata', [])
+        if media_type == 'movie':
+            return [self._normalize_movie(d) for d in items]
+        return [self._normalize_show(d) for d in items]
+
+    def get_stream_url(self, item):
+        """Return a direct stream URL for a normalized item."""
+        parts = item.get('media_parts', [])
+        if not parts or not parts[0].get('key'):
+            return None
+        return f"{self.url}{parts[0]['key']}?X-Plex-Token={self.token}"
+
+    def get_show_for_episode(self, episode):
+        """Fetch and return the parent show for a normalized episode dict."""
+        show_id = episode.get('show_id')
+        if not show_id:
+            return None
+        return self.get_item(show_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EmbyJellyfinClient — raw HTTP interface for Emby and Jellyfin
+# Both servers share almost identical APIs; the only differences are the
+# auth header name and a few minor endpoint paths.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EmbyJellyfinClient:
+    """
+    HTTP client for Emby and Jellyfin media servers.
+    Returns normalized dicts matching PlexClient's output format exactly.
+    """
+
+    def __init__(self, url, api_key, user_id, flavour='jellyfin'):
+        self.url         = url.rstrip('/')
+        self.api_key     = api_key
+        self.user_id     = user_id
+        self.flavour     = flavour   # 'emby' or 'jellyfin'
+        self.server_name = ''
+        self.machine_id  = ''
+        self._session    = requests.Session()
+        # Both servers accept api_key as query param — simplest universal approach
+        self._session.headers.update({
+            'Accept': 'application/json',
+        })
+
+    # ── Connection ──────────────────────────────────────────────────────────
+
+    def connect(self):
+        try:
+            r    = self._get('/System/Info')
+            self.server_name = r.get('ServerName', '')
+            self.machine_id  = r.get('Id', '')
+            return True
+        except Exception as e:
+            print(f"[{self.flavour.upper()}] Connection failed: {e}")
+            return False
+
+    def _get(self, path, params=None):
+        p = {'api_key': self.api_key}
+        if params:
+            p.update(params)
+        r = self._session.get(self.url + path, params=p, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    # ── User discovery (for setup UI) ───────────────────────────────────────
+
+    def get_users(self):
+        """Return list of {'id', 'name'} for all users — used by setup UI."""
+        try:
+            users = self._get('/Users')
+            return [{'id': u['Id'], 'name': u['Name']} for u in users]
+        except Exception as e:
+            print(f"[{self.flavour.upper()}] Error fetching users: {e}")
+            return []
+
+    # ── Libraries ───────────────────────────────────────────────────────────
+
+    def get_libraries(self):
+        data  = self._get(f'/Users/{self.user_id}/Views')
+        items = data.get('Items', [])
+        libs  = []
+        for item in items:
+            col_type = item.get('CollectionType', '')
+            if col_type == 'movies':
+                lib_type = 'movie'
+            elif col_type == 'tvshows':
+                lib_type = 'show'
+            else:
+                continue   # skip music, photos, etc.
+            libs.append({'id': item['Id'], 'title': item['Name'], 'type': lib_type})
+        return libs
+
+    def total_view_size(self, lib_id, media_type='movie'):
+        try:
+            include_type = 'Movie' if media_type == 'movie' else 'Series'
+            r = self._get(f'/Users/{self.user_id}/Items', {
+                'ParentId': lib_id, 'IncludeItemTypes': include_type,
+                'Recursive': 'true', 'Limit': 0
+            })
+            return r.get('TotalRecordCount', 0)
+        except Exception:
+            return 0
+
+    # ── Normalization ────────────────────────────────────────────────────────
+
+    def _img(self, item_id, tag, img_type='Primary'):
+        """Build an absolute image URL."""
+        if not tag:
+            return ''
+        return f"{self.url}/Items/{item_id}/Images/{img_type}?api_key={self.api_key}"
+
+    def _normalize_movie(self, d):
+        item_id = d.get('Id', '')
+        genres  = d.get('Genres', [])
+        stream_path = f"/Videos/{item_id}/stream?api_key={self.api_key}&static=true"
+        return {
+            'id':             item_id,
+            'title':          d.get('Name', ''),
+            'year':           d.get('ProductionYear'),
+            'summary':        d.get('Overview', ''),
+            'rating':         d.get('CommunityRating'),
+            'content_rating': d.get('OfficialRating', ''),
+            'thumb':          self._img(item_id, d.get('ImageTags', {}).get('Primary')),
+            'art':            self._img(item_id, d.get('BackdropImageTags', [''])[0] if d.get('BackdropImageTags') else '', 'Backdrop'),
+            'genres':         genres,
+            'added_at':       0,
+            'duration':       d.get('RunTimeTicks', 0) // 10000 if d.get('RunTimeTicks') else 0,
+            'view_offset':    d.get('UserData', {}).get('PlaybackPositionTicks', 0) // 10000,
+            'type':           'movie',
+            'media_parts':    [{'key': stream_path, 'container': 'mkv'}],
+            'directors':      [p['Name'] for p in d.get('People', []) if p.get('Type') == 'Director'],
+            'roles':          [p['Name'] for p in d.get('People', []) if p.get('Type') == 'Actor'][:10],
+            'original_title': d.get('OriginalTitle', d.get('Name', '')),
+        }
+
+    def _normalize_show(self, d):
+        item_id = d.get('Id', '')
+        return {
+            'id':        item_id,
+            'title':     d.get('Name', ''),
+            'year':      d.get('ProductionYear'),
+            'summary':   d.get('Overview', ''),
+            'rating':    d.get('CommunityRating'),
+            'thumb':     self._img(item_id, d.get('ImageTags', {}).get('Primary')),
+            'art':       self._img(item_id, d.get('BackdropImageTags', [''])[0] if d.get('BackdropImageTags') else '', 'Backdrop'),
+            'genres':    d.get('Genres', []),
+            'added_at':  0,
+            'duration':  0,
+            'type':      'show',
+            'directors': [],
+            'roles':     [p['Name'] for p in d.get('People', []) if p.get('Type') == 'Actor'][:10],
+        }
+
+    def _normalize_episode(self, d):
+        item_id     = d.get('Id', '')
+        stream_path = f"/Videos/{item_id}/stream?api_key={self.api_key}&static=true"
+        return {
+            'id':             item_id,
+            'title':          d.get('Name', ''),
+            'summary':        d.get('Overview', ''),
+            'rating':         d.get('CommunityRating'),
+            'thumb':          self._img(item_id, d.get('ImageTags', {}).get('Primary')),
+            'added_at':       0,
+            'duration':       d.get('RunTimeTicks', 0) // 10000 if d.get('RunTimeTicks') else 0,
+            'view_offset':    d.get('UserData', {}).get('PlaybackPositionTicks', 0) // 10000,
+            'type':           'episode',
+            'season_number':  d.get('ParentIndexNumber'),
+            'episode_number': d.get('IndexNumber'),
+            'air_date':       d.get('PremiereDate', '')[:10] if d.get('PremiereDate') else '',
+            'media_parts':    [{'key': stream_path, 'container': 'mkv'}],
+            'show_id':        d.get('SeriesId', ''),
+        }
+
+    def _normalize_season(self, d):
+        item_id = d.get('Id', '')
+        return {
+            'id':            item_id,
+            'title':         d.get('Name', ''),
+            'summary':       d.get('Overview', ''),
+            'season_number': d.get('IndexNumber'),
+            'year':          d.get('ProductionYear'),
+            'thumb':         self._img(item_id, d.get('ImageTags', {}).get('Primary')),
+            'art':           '',
+            'type':          'season',
+        }
+
+    # ── Items ────────────────────────────────────────────────────────────────
+
+    def _items(self, params):
+        params.setdefault('UserId', self.user_id)
+        params.setdefault('Recursive', 'true')
+        r = self._get(f'/Users/{self.user_id}/Items', params)
+        return r.get('Items', [])
+
+    def get_item(self, item_id):
+        try:
+            d = self._get(f'/Users/{self.user_id}/Items/{item_id}')
+            t = d.get('Type', '')
+            if t == 'Movie':   return self._normalize_movie(d)
+            if t == 'Series':  return self._normalize_show(d)
+            if t == 'Episode': return self._normalize_episode(d)
+            return d
+        except Exception as e:
+            print(f"[{self.flavour.upper()}] get_item error: {e}")
+            return None
+
+    def get_all_movies(self, lib_id, limit=None):
+        print(f"[{self.flavour.upper()}] get_all_movies: {self.url}/Users/{self.user_id}/Items?ParentId={lib_id}")
+        p = {'ParentId': lib_id, 'IncludeItemTypes': 'Movie',
+             'Fields': 'Genres,People,Overview,BackdropImageTags'}
+        if limit:
+            p['Limit'] = limit
+        return [self._normalize_movie(d) for d in self._items(p)]
+
+    def get_all_shows(self, lib_id, limit=None):
+        p = {'ParentId': lib_id, 'IncludeItemTypes': 'Series',
+             'Fields': 'Genres,People,Overview,BackdropImageTags'}
+        if limit:
+            p['Limit'] = limit
+        return [self._normalize_show(d) for d in self._items(p)]
+
+    def get_recently_added(self, lib_id, limit=50):
+        p = {'ParentId': lib_id, 'Limit': limit,
+             'SortBy': 'DateCreated', 'SortOrder': 'Descending',
+             'Fields': 'Genres,Overview,BackdropImageTags'}
+        items = self._items(p)
+        result = []
+        for d in items:
+            t = d.get('Type', '')
+            if t == 'Movie':  result.append(self._normalize_movie(d))
+            elif t == 'Series': result.append(self._normalize_show(d))
+        return result
+
+    def get_unwatched_movies(self, lib_id, limit=None):
+        p = {'ParentId': lib_id, 'IncludeItemTypes': 'Movie',
+             'IsPlayed': 'false', 'Fields': 'Genres,Overview,BackdropImageTags'}
+        if limit:
+            p['Limit'] = limit
+        return [self._normalize_movie(d) for d in self._items(p)]
+
+    def get_unwatched_shows(self, lib_id, limit=None):
+        p = {'ParentId': lib_id, 'IncludeItemTypes': 'Series',
+             'IsPlayed': 'false', 'Fields': 'Genres,Overview,BackdropImageTags'}
+        if limit:
+            p['Limit'] = limit
+        return [self._normalize_show(d) for d in self._items(p)]
+
+    def get_by_genre(self, lib_id, genre, media_type='movie', limit=200):
+        include = 'Movie' if media_type == 'movie' else 'Series'
+        p = {'ParentId': lib_id, 'IncludeItemTypes': include,
+             'Genres': genre, 'Limit': limit,
+             'Fields': 'Genres,Overview,BackdropImageTags'}
+        items = self._items(p)
+        if media_type == 'movie':
+            return [self._normalize_movie(d) for d in items]
+        return [self._normalize_show(d) for d in items]
+
+    def get_by_decade(self, lib_id, decade, media_type='movie', limit=200):
+        include = 'Movie' if media_type == 'movie' else 'Series'
+        p = {'ParentId': lib_id, 'IncludeItemTypes': include,
+             'Years': ','.join(str(y) for y in range(decade, decade + 10)),
+             'Limit': limit, 'Fields': 'Genres,Overview,BackdropImageTags'}
+        items = self._items(p)
+        if media_type == 'movie':
+            return [self._normalize_movie(d) for d in items]
+        return [self._normalize_show(d) for d in items]
+
+    def get_genres(self, lib_id, media_type='movie'):
+        include = 'Movie' if media_type == 'movie' else 'Series'
+        try:
+            r = self._get('/Genres', {'ParentId': lib_id,
+                                      'IncludeItemTypes': include,
+                                      'UserId': self.user_id})
+            return sorted(item['Name'] for item in r.get('Items', []))
+        except Exception as e:
+            print(f"[{self.flavour.upper()}] Error getting genres: {e}")
+            return []
+
+    def get_decades(self, lib_id, media_type='movie'):
+        include = 'Movie' if media_type == 'movie' else 'Series'
+        try:
+            items   = self._items({'ParentId': lib_id, 'IncludeItemTypes': include,
+                                   'Fields': '', 'Limit': 2000})
+            decades = set()
+            for d in items:
+                year = d.get('ProductionYear')
+                if year:
+                    decade = (year // 10) * 10
+                    if decade >= 1920:
+                        decades.add(decade)
+            return sorted(decades, reverse=True)
+        except Exception as e:
+            print(f"[{self.flavour.upper()}] Error getting decades: {e}")
+            return []
+
+    def get_collections(self, lib_id):
+        try:
+            items = self._items({'ParentId': lib_id, 'IncludeItemTypes': 'BoxSet',
+                                 'Fields': ''})
+            return [{'id': d['Id'], 'title': d['Name']} for d in items]
+        except Exception as e:
+            print(f"[{self.flavour.upper()}] Error getting collections: {e}")
+            return []
+
+    def get_collection_items(self, collection_id, media_type='movie'):
+        try:
+            items = self._items({'ParentId': collection_id,
+                                 'Fields': 'Genres,Overview,BackdropImageTags'})
+            if media_type == 'movie':
+                return [self._normalize_movie(d) for d in items if d.get('Type') == 'Movie']
+            return [self._normalize_show(d) for d in items if d.get('Type') == 'Series']
+        except Exception as e:
+            print(f"[{self.flavour.upper()}] Error getting collection items: {e}")
+            return []
+
+    def get_on_deck(self, limit=50):
+        try:
+            r     = self._get(f'/Users/{self.user_id}/Items/Resume',
+                              {'Limit': limit * 2,
+                               'Fields': 'Genres,Overview,BackdropImageTags,UserData'})
+            items = r.get('Items', [])
+            result = []
+            for d in items:
+                t = d.get('Type', '')
+                if   t == 'Movie':   result.append(self._normalize_movie(d))
+                elif t == 'Episode': result.append(self._normalize_episode(d))
+            return result
+        except Exception as e:
+            print(f"[{self.flavour.upper()}] Error getting on deck: {e}")
+            return []
+
+    def get_seasons(self, show_id):
+        try:
+            r = self._get(f'/Shows/{show_id}/Seasons',
+                          {'UserId': self.user_id, 'Fields': 'Overview'})
+            return [self._normalize_season(d) for d in r.get('Items', [])]
+        except Exception as e:
+            print(f"[{self.flavour.upper()}] Error getting seasons: {e}")
+            return []
+
+    def get_episodes(self, season_id):
+        try:
+            # season_id here is the season's item ID
+            r = self._get(f'/Users/{self.user_id}/Items',
+                          {'ParentId': season_id, 'Fields': 'Overview,UserData'})
+            return [self._normalize_episode(d) for d in r.get('Items', [])
+                    if d.get('Type') == 'Episode']
+        except Exception as e:
+            print(f"[{self.flavour.upper()}] Error getting episodes: {e}")
+            return []
+
+    def search(self, lib_id, query, media_type='movie', limit=20):
+        include = 'Movie' if media_type == 'movie' else 'Series'
+        items   = self._items({'ParentId': lib_id, 'SearchTerm': query,
+                               'IncludeItemTypes': include, 'Limit': limit,
+                               'Fields': 'Genres,Overview'})
+        if media_type == 'movie':
+            return [self._normalize_movie(d) for d in items]
+        return [self._normalize_show(d) for d in items]
+
+    def get_stream_url(self, item):
+        parts = item.get('media_parts', [])
+        if not parts or not parts[0].get('key'):
+            return None
+        return self.url + parts[0]['key']
+
+    def get_show_for_episode(self, episode):
+        show_id = episode.get('show_id')
+        if not show_id:
+            return None
+        return self.get_item(show_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Global media server client — set by connect_server() on startup
+# ─────────────────────────────────────────────────────────────────────────────
+media_client = None
+plex         = None   # alias kept for any missed references during transition
 cache_queue = Queue()
 cache_warming_active = False
 last_library_scan = 0
 known_items = set()  # Track known movie/show IDs
 
 def scan_for_new_content():
-    """Periodically scan Plex for new content and cache it"""
+    """Periodically scan for new content and cache TMDb metadata."""
     global last_library_scan, known_items
-    
-    if not plex or not TMDB_API_KEY:
+
+    if not media_client or not TMDB_API_KEY:
         return
-    
+
     current_time = time.time()
-    
-    # Only scan every 5 minutes
     if current_time - last_library_scan < 300:
         return
-    
     last_library_scan = current_time
-    
+
     try:
         new_items_found = 0
-        
-        # Scan movie libraries
-        for section in plex.library.sections():
-            if section.type == 'movie':
-                for movie in section.recentlyAdded(maxresults=50):  # Check last 50 added
-                    item_id = f"movie_{movie.ratingKey}"
-                    
-                    # New item detected
+        for section in get_cached_sections():
+            if section['type'] == 'movie':
+                for item in media_client.get_recently_added(section['id'], 50):
+                    if item['type'] != 'movie':
+                        continue
+                    item_id = f"movie_{item['id']}"
                     if item_id not in known_items:
                         known_items.add(item_id)
-                        
-                        # Check if already cached
-                        cache_key = f"movie_{movie.ratingKey}"
-                        if cache_key not in metadata_cache.get('movies', {}):
-                            cache_queue.put(('movie', movie))
+                        if item_id not in session_cache.get('movies', {}):
+                            cache_queue.put(('movie', item))
                             new_items_found += 1
-                            print(f"[AUTO-CACHE] New movie detected: {movie.title}")
-            
-            elif section.type == 'show':
-                for show in section.recentlyAdded(maxresults=50):  # Check last 50 added
-                    item_id = f"show_{show.ratingKey}"
-                    
-                    # New item detected
+            elif section['type'] == 'show':
+                for item in media_client.get_recently_added(section['id'], 50):
+                    if item['type'] != 'show':
+                        continue
+                    item_id = f"show_{item['id']}"
                     if item_id not in known_items:
                         known_items.add(item_id)
-                        
-                        # Check if already cached (use 'series' for cache key)
-                        cache_key = f"series_{show.ratingKey}"
-                        if cache_key not in metadata_cache.get('series', {}):
-                            # Queue as 'series' type for worker
-                            cache_queue.put(('series', show))
+                        if f"series_{item['id']}" not in session_cache.get('series', {}):
+                            cache_queue.put(('series', item))
                             new_items_found += 1
-                            print(f"[AUTO-CACHE] New show detected: {show.title}")
-        
+
         if new_items_found > 0:
             print(f"[AUTO-CACHE] Queued {new_items_found} new items for caching")
-    
     except Exception as e:
         print(f"[AUTO-CACHE] Error scanning for new content: {e}")
 
 def initialize_known_items():
-    """Build initial set of known items from Plex"""
+    """Build initial set of known items from the media server."""
     global known_items
-    
-    if not plex:
+    if not media_client:
         return
-    
     try:
-        for section in plex.library.sections():
-            if section.type == 'movie':
-                for movie in section.all():
-                    known_items.add(f"movie_{movie.ratingKey}")
-            elif section.type == 'show':
-                for show in section.all():
-                    known_items.add(f"show_{show.ratingKey}")
-        
+        for section in get_cached_sections():
+            if section['type'] == 'movie':
+                for item in media_client.get_all_movies(section['id']):
+                    known_items.add(f"movie_{item['id']}")
+            elif section['type'] == 'show':
+                for item in media_client.get_all_shows(section['id']):
+                    known_items.add(f"show_{item['id']}")
         print(f"[AUTO-CACHE] Initialized tracking for {len(known_items)} items")
     except Exception as e:
         print(f"[AUTO-CACHE] Error initializing known items: {e}")
@@ -135,75 +803,53 @@ def cache_worker():
             if item is None:  # Poison pill to stop worker
                 print("[CACHE] Received stop signal")
                 break
-            
-            item_type, plex_item = item
-            
-            # Validate item
-            if not plex_item or not hasattr(plex_item, 'ratingKey'):
+
+            item_type, norm_item = item
+
+            # Validate item — normalized dicts always have 'id' and 'title'
+            if not norm_item or not isinstance(norm_item, dict) or 'id' not in norm_item:
                 print(f"[CACHE] Invalid item in queue: {item}")
                 cache_queue.task_done()
                 continue
-            
-            cache_key = f"{item_type}_{plex_item.ratingKey}"
-            
+
+            cache_key      = f"{item_type}_{norm_item['id']}"
+            cache_category = 'movies' if item_type == 'movie' else 'series'
+
             # Skip if already cached
-            if cache_key in metadata_cache.get(item_type + 's', {}):
-                print(f"[CACHE] Skipping (already cached): {plex_item.title if hasattr(plex_item, 'title') else cache_key}")
+            if cache_key in session_cache.get(cache_category, {}):
                 cache_queue.task_done()
                 continue
-            
+
             # Fetch TMDb data
             try:
                 if item_type == 'movie':
-                    tmdb_data = enhance_movie_with_tmdb(plex_item)
+                    tmdb_data = enhance_movie_with_tmdb(norm_item)
                 elif item_type == 'series':
-                    tmdb_data = enhance_series_with_tmdb(plex_item)
+                    tmdb_data = enhance_series_with_tmdb(norm_item)
                 else:
-                    print(f"[CACHE] Unknown item type: {item_type}")
                     items_failed += 1
                     cache_queue.task_done()
                     continue
-                
+
                 if tmdb_data:
-                    # Ensure cache structure exists
-                    cache_category = item_type + 's'  # 'movies' or 'seriess' - WAIT, THIS IS WRONG!
-                    
-                    # Fix: 'series' + 's' = 'seriess' which is wrong!
-                    # Should be: 'movie' -> 'movies', 'series' -> 'series' (already plural)
-                    if item_type == 'movie':
-                        cache_category = 'movies'
-                    elif item_type == 'series':
-                        cache_category = 'series'  # Don't add 's'
-                    else:
-                        cache_category = item_type + 's'
-                    
-                    if cache_category not in metadata_cache:
-                        metadata_cache[cache_category] = {}
-                    
-                    metadata_cache[cache_category][cache_key] = tmdb_data
+                    if cache_category not in session_cache:
+                        session_cache[cache_category] = {}
+                    session_cache[cache_category][cache_key] = tmdb_data
                     items_processed += 1
-                    
-                    # Debug: Show what we just saved
-                    if item_type == 'series':
-                        current_series_count = len(metadata_cache.get('series', {}))
-                        print(f"[CACHE] ✓ Cached {item_type}: {plex_item.title if hasattr(plex_item, 'title') else cache_key} (Total series now: {current_series_count})")
-                    else:
-                        print(f"[CACHE] ✓ Cached {item_type}: {plex_item.title if hasattr(plex_item, 'title') else cache_key}")
-                    
-                    # Progress update every 10 items
+                    title = norm_item.get('title', cache_key)
+                    print(f"[CACHE] ✓ Cached {item_type}: {title}")
+
                     if items_processed % 10 == 0:
                         remaining = cache_queue.qsize()
-                        movies = len(metadata_cache.get('movies', {}))
-                        series = len(metadata_cache.get('series', {}))
+                        movies    = len(session_cache.get('movies', {}))
+                        series    = len(session_cache.get('series', {}))
                         print(f"[CACHE] Progress: {items_processed} cached, {items_failed} failed, {remaining} in queue (Movies: {movies}, Shows: {series})")
                 else:
                     items_failed += 1
-                    print(f"[CACHE] ✗ No TMDb data for {item_type}: {plex_item.title if hasattr(plex_item, 'title') else cache_key}")
+                    print(f"[CACHE] ✗ No TMDb data for {item_type}: {norm_item.get('title', cache_key)}")
             except Exception as e:
                 items_failed += 1
-                print(f"[CACHE] ✗ Error caching {plex_item.title if hasattr(plex_item, 'title') else 'item'}: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"[CACHE] ✗ Error caching {norm_item.get('title', 'item')}: {e}")
             
             cache_queue.task_done()
             
@@ -247,45 +893,49 @@ def start_cache_warming():
     print("[CACHE] Background cache warming enabled")
 
 def warm_cache_for_library(section_type='movie', limit=None):
-    """Queue items from library for background caching"""
+    """Queue items from library for background TMDb caching."""
     if not TMDB_API_KEY:
         print("[CACHE] TMDb API key not set, skipping cache warming")
         return
-    
+    if not media_client:
+        return
+
+    cache_type = 'movie' if section_type == 'movie' else 'series'
+    count = 0
+
     try:
-        # Map section_type to Plex type and cache type
-        plex_type = section_type if section_type == 'movie' else 'show'
-        cache_type = section_type if section_type == 'movie' else 'series'
-        
-        count = 0
-        for section in plex.library.sections():
-            if section.type == plex_type:
-                items = section.all()
-                print(f"[CACHE] Found {len(items)} {plex_type}s in section '{section.title}'")
-                
+        for section in get_cached_sections():
+            if section['type'] == section_type or (section_type != 'movie' and section['type'] == 'show'):
+                if section_type == 'movie':
+                    items = media_client.get_all_movies(section['id'])
+                else:
+                    items = media_client.get_all_shows(section['id'])
+
+                print(f"[CACHE] Found {len(items)} items in section '{section['title']}'")
+
                 for item in items:
                     if limit and count >= limit:
                         break
-                    
-                    # Check if already cached (use correct cache type)
-                    cache_key = f"{cache_type}_{item.ratingKey}"
-                    if cache_key not in metadata_cache.get(cache_type + 's', {}):
-                        # Queue with correct type for worker
+                    cache_key = f"{cache_type}_{item['id']}"
+                    cache_bucket = 'movies' if cache_type == 'movie' else 'series'
+                    if cache_key not in session_cache.get(cache_bucket, {}):
                         cache_queue.put((cache_type, item))
                         count += 1
-                
+
                 if limit and count >= limit:
                     break
-        
-        print(f"[CACHE] Queued {count} {plex_type}s for background caching")
+
+        print(f"[CACHE] Queued {count} items for background caching")
     except Exception as e:
         print(f"[CACHE] Error warming cache: {e}")
-        import traceback
-        traceback.print_exc()
 
 # Configuration - Update these with your settings
-PLEX_URL = os.getenv('PLEX_URL', '')
-PLEX_TOKEN = os.getenv('PLEX_TOKEN', '')
+PLEX_URL    = os.getenv('PLEX_URL', '')
+PLEX_TOKEN  = os.getenv('PLEX_TOKEN', '')
+SERVER_TYPE = os.getenv('SERVER_TYPE', 'plex')   # 'plex', 'emby', 'jellyfin'
+EMBY_URL     = os.getenv('EMBY_URL', '')
+EMBY_API_KEY = os.getenv('EMBY_API_KEY', '')
+EMBY_USER_ID = os.getenv('EMBY_USER_ID', '')
 BRIDGE_USERNAME = os.getenv('BRIDGE_USERNAME', 'admin')
 BRIDGE_PASSWORD = os.getenv('BRIDGE_PASSWORD', 'admin')
 BRIDGE_HOST = os.getenv('BRIDGE_HOST', '0.0.0.0')
@@ -384,56 +1034,93 @@ auto_matching_running = False
 last_auto_match_time = 0
 
 def auto_match_content():
-    """Background task to auto-match unmatched content with TMDb"""
+    """Background task to auto-match unmatched content with TMDb."""
     global auto_matching_running, last_auto_match_time
-    
-    if not TMDB_API_KEY or not plex:
+
+    if not TMDB_API_KEY or not media_client:
         return
-    
+
     auto_matching_running = True
     matched_count = 0
-    
+
     try:
         print("[AUTO-MATCH] Starting auto-match scan...")
-        
-        # Match movies
-        for section in plex.library.sections():
-            if section.type == 'movie':
-                for movie in section.all():
-                    cache_key = f"movie_{movie.ratingKey}"
+
+        for section in get_cached_sections():
+            if section['type'] == 'movie':
+                for item in media_client.get_all_movies(section['id']):
+                    cache_key = f"movie_{item['id']}"
                     if cache_key not in session_cache['movies']:
-                        # Try to match with TMDb
-                        tmdb_data = enhance_movie_with_tmdb(movie)
+                        tmdb_data = enhance_movie_with_tmdb(item)
                         if tmdb_data:
                             session_cache['movies'][cache_key] = tmdb_data
                             matched_count += 1
-                            print(f"[AUTO-MATCH] Matched movie: {movie.title}")
-            
-            elif section.type == 'show':
-                for show in section.all():
-                    cache_key = f"series_{show.ratingKey}"
+                            print(f"[AUTO-MATCH] Matched movie: {item.get('title', item['id'])}")
+            elif section['type'] == 'show':
+                for item in media_client.get_all_shows(section['id']):
+                    cache_key = f"series_{item['id']}"
                     if cache_key not in session_cache['series']:
-                        # Try to match with TMDb
-                        tmdb_data = enhance_series_with_tmdb(show)
+                        tmdb_data = enhance_series_with_tmdb(item)
                         if tmdb_data:
                             session_cache['series'][cache_key] = tmdb_data
                             matched_count += 1
-                            print(f"[AUTO-MATCH] Matched show: {show.title}")
-        
+                            print(f"[AUTO-MATCH] Matched show: {item.get('title', item['id'])}")
+
         print(f"[AUTO-MATCH] Completed! Matched {matched_count} items")
         last_auto_match_time = time.time()
-        
-        # Save cache to disk
+
         if matched_count > 0:
             save_cache_to_disk()
-    
+
     except Exception as e:
         print(f"[AUTO-MATCH] Error: {e}")
-    
     finally:
         auto_matching_running = False
 
-def background_auto_matcher():
+
+def scan_for_new_plex_content():
+    """Scan for new content and pre-cache TMDb data."""
+    global known_item_ids, last_scan_time
+
+    if not media_client or not TMDB_API_KEY:
+        return
+
+    try:
+        new_items = 0
+        for section in get_cached_sections():
+            if section['type'] == 'movie':
+                for item in media_client.get_all_movies(section['id']):
+                    item_id = f"movie_{item['id']}"
+                    if item_id not in known_item_ids:
+                        known_item_ids.add(item_id)
+                        cache_key = f"movie_{item['id']}"
+                        if cache_key not in session_cache['movies']:
+                            tmdb_data = enhance_movie_with_tmdb(item)
+                            if tmdb_data:
+                                session_cache['movies'][cache_key] = tmdb_data
+                                new_items += 1
+                                print(f"[NEW] Cached new movie: {item.get('title', item['id'])}")
+            elif section['type'] == 'show':
+                for item in media_client.get_all_shows(section['id']):
+                    item_id = f"show_{item['id']}"
+                    if item_id not in known_item_ids:
+                        known_item_ids.add(item_id)
+                        cache_key = f"series_{item['id']}"
+                        if cache_key not in session_cache['series']:
+                            tmdb_data = enhance_series_with_tmdb(item)
+                            if tmdb_data:
+                                session_cache['series'][cache_key] = tmdb_data
+                                new_items += 1
+                                print(f"[NEW] Cached new show: {item.get('title', item['id'])}")
+
+        if new_items > 0:
+            print(f"[SCAN] Found and cached {new_items} new items")
+        last_scan_time = time.time()
+
+    except Exception as e:
+        print(f"[SCAN] Error scanning for new content: {e}")
+
+
     """Background thread that runs auto-matching on startup and every 30 minutes"""
     print("[AUTO-MATCH] Background auto-matcher started")
     
@@ -451,124 +1138,45 @@ def background_auto_matcher():
 
 # Cache library sections (updated every 5 minutes)
 def get_cached_sections():
-    """Get library sections with caching to reduce Plex API calls"""
+    """Get library sections with caching to reduce API calls."""
     current_time = time.time()
-    
     if session_cache['sections'] and (current_time - session_cache['sections_time']) < 300:
         return session_cache['sections']
-    
-    # Refresh sections
-    if plex:
-        session_cache['sections'] = list(plex.library.sections())
+    if media_client:
+        session_cache['sections']      = media_client.get_libraries()
         session_cache['sections_time'] = current_time
-    
-    return session_cache['sections']
+    return session_cache.get('sections') or []
 
 # Track known items to detect new content
 known_item_ids = set()
 last_scan_time = 0
 
-def scan_for_new_plex_content():
-    """Scan Plex for new content and pre-cache TMDb data"""
-    global known_item_ids, last_scan_time
-    
-    if not plex or not TMDB_API_KEY:
-        return
-    
-    try:
-        new_items = 0
-        
-        # Scan all sections
-        for section in plex.library.sections():
-            if section.type == 'movie':
-                for movie in section.all():
-                    item_id = f"movie_{movie.ratingKey}"
-                    
-                    # New movie detected
-                    if item_id not in known_item_ids:
-                        known_item_ids.add(item_id)
-                        
-                        # Pre-cache TMDb data
-                        cache_key = f"movie_{movie.ratingKey}"
-                        if cache_key not in session_cache['movies']:
-                            tmdb_data = enhance_movie_with_tmdb(movie)
-                            if tmdb_data:
-                                session_cache['movies'][cache_key] = tmdb_data
-                                new_items += 1
-                                print(f"[NEW] Cached new movie: {movie.title}")
-            
-            elif section.type == 'show':
-                for show in section.all():
-                    item_id = f"show_{show.ratingKey}"
-                    
-                    # New show detected
-                    if item_id not in known_item_ids:
-                        known_item_ids.add(item_id)
-                        
-                        # Pre-cache TMDb data
-                        cache_key = f"series_{show.ratingKey}"
-                        if cache_key not in session_cache['series']:
-                            tmdb_data = enhance_series_with_tmdb(show)
-                            if tmdb_data:
-                                session_cache['series'][cache_key] = tmdb_data
-                                new_items += 1
-                                print(f"[NEW] Cached new show: {show.title}")
-        
-        if new_items > 0:
-            print(f"[SCAN] Found and cached {new_items} new items")
-        
-        last_scan_time = time.time()
-    
-    except Exception as e:
-        print(f"[SCAN] Error scanning for new content: {e}")
+def background_auto_matcher():
+    """Background thread that runs TMDb auto-matching on startup then every 30 minutes."""
+    print("[AUTO-MATCH] Background auto-matcher started")
+    auto_match_content()
+    while True:
+        time.sleep(1800)
+        if not auto_matching_running:
+            print("[AUTO-MATCH] Running scheduled auto-match...")
+            auto_match_content()
+
 
 def background_scanner():
-    """Background thread that scans every 15 minutes"""
+    """Background thread that scans every 15 minutes."""
     global last_scan_time
-    
     print("[SCAN] Background scanner started - checking every 15 minutes")
-    
-    # Don't scan on startup, wait for first interval
     last_scan_time = time.time()
-    
     while True:
-        time.sleep(900)  # 15 minutes = 900 seconds
-        
+        time.sleep(900)
         print("[SCAN] Running 15-minute scan for new content...")
         scan_for_new_plex_content()
 
-def get_poster_url(item, tmdb_data=None):
-    """Get best available poster URL"""
-    # Priority: TMDb high-res > Plex
-    if tmdb_data and tmdb_data.get('poster_path'):
-        return tmdb_data['poster_path']
-    
-    # Fallback to Plex
-    if hasattr(item, 'thumb') and item.thumb:
-        return f"{PLEX_URL}{item.thumb}?X-Plex-Token={PLEX_TOKEN}"
-    
-    return ""
-
-def get_backdrop_url(item, tmdb_data=None):
-    """Get best available backdrop URL"""
-    # Priority: TMDb high-res > Plex
-    if tmdb_data and tmdb_data.get('backdrop_path'):
-        return tmdb_data['backdrop_path']
-    
-    # Fallback to Plex
-    if hasattr(item, 'art') and item.art:
-        return f"{PLEX_URL}{item.art}?X-Plex-Token={PLEX_TOKEN}"
-    
-    return ""
 
 def clear_metadata_cache():
-    """Clear the metadata cache"""
-    global metadata_cache
-    metadata_cache = {
-        'movies': {},
-        'series': {},
-        'last_refresh': 0
-    }
+    """Clear the in-memory TMDb cache."""
+    session_cache['movies'] = {}
+    session_cache['series'] = {}
     print("✓ Metadata cache cleared")
 
 # Encryption setup
@@ -707,133 +1315,122 @@ def fetch_tmdb_data(title, year=None, media_type='movie'):
         print(f"Error fetching TMDb data: {e}")
         return None
 
-def enhance_movie_with_tmdb(movie):
-    """Enhance movie data with TMDb metadata"""
+def enhance_movie_with_tmdb(item):
+    """Enhance a normalized movie dict with TMDb metadata."""
     if not TMDB_API_KEY:
         return {}
-    
     try:
-        # Get year from Plex
-        year = movie.year if hasattr(movie, 'year') else None
-        
-        # Fetch TMDb data
-        tmdb_data = fetch_tmdb_data(movie.title, year, 'movie')
-        
+        tmdb_data = fetch_tmdb_data(item.get('title', ''), item.get('year'), 'movie')
         if tmdb_data:
-            enhanced = {
-                'tmdb_id': tmdb_data.get('id'),
-                'imdb_id': tmdb_data.get('imdb_id', ''),
-                'overview': tmdb_data.get('overview', ''),
-                'tagline': tmdb_data.get('tagline', ''),
-                'popularity': tmdb_data.get('popularity', 0),
+            return {
+                'tmdb_id':      tmdb_data.get('id'),
+                'imdb_id':      tmdb_data.get('imdb_id', ''),
+                'overview':     tmdb_data.get('overview', ''),
+                'tagline':      tmdb_data.get('tagline', ''),
+                'popularity':   tmdb_data.get('popularity', 0),
                 'vote_average': tmdb_data.get('vote_average', 0),
-                'vote_count': tmdb_data.get('vote_count', 0),
-                'backdrop_path': f"https://image.tmdb.org/t/p/original{tmdb_data.get('backdrop_path')}" if tmdb_data.get('backdrop_path') else '',
-                'poster_path': f"https://image.tmdb.org/t/p/original{tmdb_data.get('poster_path')}" if tmdb_data.get('poster_path') else '',
-                'genres': [g['name'] for g in tmdb_data.get('genres', [])],
+                'vote_count':   tmdb_data.get('vote_count', 0),
+                'backdrop_path': f"https://image.tmdb.org/t/p/original{tmdb_data['backdrop_path']}" if tmdb_data.get('backdrop_path') else '',
+                'poster_path':   f"https://image.tmdb.org/t/p/original{tmdb_data['poster_path']}"   if tmdb_data.get('poster_path')   else '',
+                'genres':   [g['name'] for g in tmdb_data.get('genres', [])],
                 'keywords': [k['name'] for k in tmdb_data.get('keywords', {}).get('keywords', [])],
-                'cast': [{'name': c['name'], 'character': c['character']} for c in tmdb_data.get('credits', {}).get('cast', [])[:10]],
+                'cast':     [{'name': c['name'], 'character': c['character']} for c in tmdb_data.get('credits', {}).get('cast', [])[:10]],
                 'director': next((c['name'] for c in tmdb_data.get('credits', {}).get('crew', []) if c['job'] == 'Director'), ''),
-                'trailer': next((f"https://www.youtube.com/watch?v={v['key']}" for v in tmdb_data.get('videos', {}).get('results', []) if v['site'] == 'YouTube' and v['type'] == 'Trailer'), '')
+                'trailer':  next((f"https://www.youtube.com/watch?v={v['key']}" for v in tmdb_data.get('videos', {}).get('results', []) if v['site'] == 'YouTube' and v['type'] == 'Trailer'), ''),
             }
-            return enhanced
     except Exception as e:
         print(f"Error enhancing movie with TMDb: {e}")
-    
     return {}
 
-def enhance_series_with_tmdb(show):
-    """Enhance TV show data with TMDb metadata"""
+
+def enhance_series_with_tmdb(item):
+    """Enhance a normalized show dict with TMDb metadata."""
     if not TMDB_API_KEY:
         return {}
-    
     try:
-        # Safely get show title
-        title = show.title if hasattr(show, 'title') else 'Unknown'
-        
-        # Get year from Plex
-        year = show.year if hasattr(show, 'year') else None
-        
-        # Fetch TMDb data
-        tmdb_data = fetch_tmdb_data(title, year, 'tv')
-        
+        tmdb_data = fetch_tmdb_data(item.get('title', ''), item.get('year'), 'tv')
         if tmdb_data:
-            enhanced = {
-                'tmdb_id': tmdb_data.get('id'),
-                'overview': tmdb_data.get('overview', ''),
-                'popularity': tmdb_data.get('popularity', 0),
+            return {
+                'tmdb_id':      tmdb_data.get('id'),
+                'overview':     tmdb_data.get('overview', ''),
+                'popularity':   tmdb_data.get('popularity', 0),
                 'vote_average': tmdb_data.get('vote_average', 0),
-                'vote_count': tmdb_data.get('vote_count', 0),
-                'backdrop_path': f"https://image.tmdb.org/t/p/original{tmdb_data.get('backdrop_path')}" if tmdb_data.get('backdrop_path') else '',
-                'poster_path': f"https://image.tmdb.org/t/p/original{tmdb_data.get('poster_path')}" if tmdb_data.get('poster_path') else '',
-                'genres': [g['name'] for g in tmdb_data.get('genres', [])],
-                'keywords': [k['name'] for k in tmdb_data.get('keywords', {}).get('results', [])] if tmdb_data.get('keywords') else [],
-                'cast': [{'name': c['name'], 'character': c['character']} for c in tmdb_data.get('credits', {}).get('cast', [])[:10]] if tmdb_data.get('credits') else [],
-                'created_by': [c['name'] for c in tmdb_data.get('created_by', [])] if tmdb_data.get('created_by') else [],
-                'networks': [n['name'] for n in tmdb_data.get('networks', [])] if tmdb_data.get('networks') else [],
-                'number_of_seasons': tmdb_data.get('number_of_seasons', 0),
+                'vote_count':   tmdb_data.get('vote_count', 0),
+                'backdrop_path': f"https://image.tmdb.org/t/p/original{tmdb_data['backdrop_path']}" if tmdb_data.get('backdrop_path') else '',
+                'poster_path':   f"https://image.tmdb.org/t/p/original{tmdb_data['poster_path']}"   if tmdb_data.get('poster_path')   else '',
+                'genres':             [g['name'] for g in tmdb_data.get('genres', [])],
+                'keywords':           [k['name'] for k in tmdb_data.get('keywords', {}).get('results', [])] if tmdb_data.get('keywords') else [],
+                'cast':               [{'name': c['name'], 'character': c['character']} for c in tmdb_data.get('credits', {}).get('cast', [])[:10]] if tmdb_data.get('credits') else [],
+                'created_by':         [c['name'] for c in tmdb_data.get('created_by', [])] if tmdb_data.get('created_by') else [],
+                'networks':           [n['name'] for n in tmdb_data.get('networks', [])]    if tmdb_data.get('networks')    else [],
+                'number_of_seasons':  tmdb_data.get('number_of_seasons', 0),
                 'number_of_episodes': tmdb_data.get('number_of_episodes', 0),
-                'status': tmdb_data.get('status', ''),
-                'trailer': next((f"https://www.youtube.com/watch?v={v['key']}" for v in tmdb_data.get('videos', {}).get('results', []) if v.get('site') == 'YouTube' and v.get('type') == 'Trailer'), '') if tmdb_data.get('videos') else ''
+                'status':  tmdb_data.get('status', ''),
+                'trailer': next((f"https://www.youtube.com/watch?v={v['key']}" for v in tmdb_data.get('videos', {}).get('results', []) if v.get('site') == 'YouTube' and v.get('type') == 'Trailer'), '') if tmdb_data.get('videos') else '',
             }
-            return enhanced
     except Exception as e:
-        print(f"[ERROR] Error enhancing series '{show.title if hasattr(show, 'title') else 'Unknown'}' with TMDb: {e}")
-        import traceback
-        traceback.print_exc()
-    
+        print(f"[ERROR] Error enhancing series '{item.get('title', 'Unknown')}' with TMDb: {e}")
     return {}
 
 def load_config():
-    """Load configuration from file"""
-    global PLEX_URL, PLEX_TOKEN, BRIDGE_USERNAME, BRIDGE_PASSWORD, ADMIN_PASSWORD, SHOW_DUMMY_CHANNEL, TMDB_API_KEY, custom_categories
-    
+    """Load configuration from file."""
+    global PLEX_URL, PLEX_TOKEN, SERVER_TYPE, EMBY_URL, EMBY_API_KEY, EMBY_USER_ID
+    global BRIDGE_USERNAME, BRIDGE_PASSWORD, ADMIN_PASSWORD, SHOW_DUMMY_CHANNEL, TMDB_API_KEY, custom_categories
+
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
-                PLEX_URL = config.get('plex_url', PLEX_URL)
-                
-                # Decrypt sensitive values
-                encrypted_token = config.get('plex_token', PLEX_TOKEN)
-                PLEX_TOKEN = decrypt_value(encrypted_token) if encrypted_token else PLEX_TOKEN
-                
-                BRIDGE_USERNAME = config.get('bridge_username', BRIDGE_USERNAME)
-                BRIDGE_PASSWORD = config.get('bridge_password', BRIDGE_PASSWORD)
-                ADMIN_PASSWORD = config.get('admin_password', ADMIN_PASSWORD)
-                SHOW_DUMMY_CHANNEL = config.get('show_dummy_channel', SHOW_DUMMY_CHANNEL)
-                
-                encrypted_tmdb = config.get('tmdb_api_key', TMDB_API_KEY)
-                TMDB_API_KEY = decrypt_value(encrypted_tmdb) if encrypted_tmdb else TMDB_API_KEY
-                
-                print("✓ Configuration loaded from file")
+
+            SERVER_TYPE = config.get('server_type', SERVER_TYPE)
+
+            PLEX_URL   = config.get('plex_url', PLEX_URL)
+            enc_token  = config.get('plex_token', PLEX_TOKEN)
+            PLEX_TOKEN = decrypt_value(enc_token) if enc_token else PLEX_TOKEN
+
+            EMBY_URL     = config.get('emby_url', EMBY_URL)
+            enc_emby_key = config.get('emby_api_key', EMBY_API_KEY)
+            EMBY_API_KEY = decrypt_value(enc_emby_key) if enc_emby_key else EMBY_API_KEY
+            EMBY_USER_ID = config.get('emby_user_id', EMBY_USER_ID)
+
+            BRIDGE_USERNAME    = config.get('bridge_username', BRIDGE_USERNAME)
+            BRIDGE_PASSWORD    = config.get('bridge_password', BRIDGE_PASSWORD)
+            ADMIN_PASSWORD     = config.get('admin_password', ADMIN_PASSWORD)
+            SHOW_DUMMY_CHANNEL = config.get('show_dummy_channel', SHOW_DUMMY_CHANNEL)
+
+            enc_tmdb    = config.get('tmdb_api_key', TMDB_API_KEY)
+            TMDB_API_KEY = decrypt_value(enc_tmdb) if enc_tmdb else TMDB_API_KEY
+
+            print("✓ Configuration loaded from file")
         except Exception as e:
             print(f"✗ Error loading config: {e}")
-    
-    # Load custom categories
+
     if os.path.exists(CATEGORIES_FILE):
         try:
             with open(CATEGORIES_FILE, 'r') as f:
                 custom_categories = json.load(f)
-                print(f"✓ Loaded {len(custom_categories.get('movies', []))} movie categories and {len(custom_categories.get('series', []))} series categories")
+            print(f"✓ Loaded {len(custom_categories.get('movies', []))} movie categories and {len(custom_categories.get('series', []))} series categories")
         except Exception as e:
             print(f"✗ Error loading categories: {e}")
 
 def save_config():
-    """Save configuration to file"""
+    """Save configuration to file."""
     config = {
-        'plex_url': PLEX_URL,
-        'plex_token': encrypt_value(PLEX_TOKEN),  # Encrypt token
-        'bridge_username': BRIDGE_USERNAME,
-        'bridge_password': BRIDGE_PASSWORD,
-        'admin_password': hash_password(ADMIN_PASSWORD),  # Hash password
+        'server_type':      SERVER_TYPE,
+        'plex_url':         PLEX_URL,
+        'plex_token':       encrypt_value(PLEX_TOKEN),
+        'emby_url':         EMBY_URL,
+        'emby_api_key':     encrypt_value(EMBY_API_KEY),
+        'emby_user_id':     EMBY_USER_ID,
+        'bridge_username':  BRIDGE_USERNAME,
+        'bridge_password':  BRIDGE_PASSWORD,
+        'admin_password':   hash_password(ADMIN_PASSWORD),
         'show_dummy_channel': SHOW_DUMMY_CHANNEL,
-        'tmdb_api_key': encrypt_value(TMDB_API_KEY)  # Encrypt API key
+        'tmdb_api_key':     encrypt_value(TMDB_API_KEY),
     }
     try:
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f, indent=2)
-        # Set restrictive permissions
         os.chmod(CONFIG_FILE, 0o600)
         print("✓ Configuration saved to file (sensitive data encrypted)")
         return True
@@ -971,307 +1568,230 @@ def get_full_category_state():
 
     return result
 
-def connect_plex():
-    """Connect to Plex server"""
-    global plex
-    if PLEX_URL and PLEX_TOKEN:
+def connect_server():
+    """Connect to the configured media server (Plex, Emby, or Jellyfin)."""
+    global plex, media_client
+
+    # Always clear the sections cache so stale IDs from a previous server
+    # don't get used with the new connection
+    session_cache['sections']      = None
+    session_cache['sections_time'] = 0
+
+    if SERVER_TYPE == 'plex':
+        if not PLEX_URL or not PLEX_TOKEN:
+            return False
         try:
-            plex = PlexServer(PLEX_URL, PLEX_TOKEN)
-            print(f"✓ Connected to Plex Server: {plex.friendlyName}")
-            return True
+            client = PlexClient(PLEX_URL, PLEX_TOKEN)
+            if client.connect():
+                media_client = client
+                plex         = client
+                print(f"✓ Connected to Plex Server: {client.server_name}")
+                return True
+            media_client = plex = None
+            return False
         except Exception as e:
             print(f"✗ Failed to connect to Plex: {e}")
-            plex = None
+            media_client = plex = None
             return False
+
+    elif SERVER_TYPE in ('emby', 'jellyfin'):
+        if not EMBY_URL or not EMBY_API_KEY or not EMBY_USER_ID:
+            return False
+        try:
+            client = EmbyJellyfinClient(EMBY_URL, EMBY_API_KEY, EMBY_USER_ID, SERVER_TYPE)
+            if client.connect():
+                media_client = client
+                plex         = client   # alias
+                print(f"✓ Connected to {SERVER_TYPE.title()} Server: {client.server_name}")
+                return True
+            media_client = plex = None
+            return False
+        except Exception as e:
+            print(f"✗ Failed to connect to {SERVER_TYPE.title()}: {e}")
+            media_client = plex = None
+            return False
+
+    print(f"✗ Unknown server type: {SERVER_TYPE}")
     return False
 
+
+# Keep connect_plex as an alias so existing call sites still work
+connect_plex = connect_server
+
 def get_smart_categories_for_movies():
-    """Generate smart categories for movies using Plex metadata"""
+    """Generate smart categories for movies using PlexClient."""
     categories = []
-    base_id = 10000
-    
-    if not plex:
+    base_id    = 10000
+
+    if not media_client:
         return categories
-    
+
     try:
-        # Get all movie sections
-        movie_sections = [s for s in plex.library.sections() if s.type == 'movie']
-        
+        movie_sections = [s for s in get_cached_sections() if s['type'] == 'movie']
+
         for section in movie_sections:
-            # Get Plex's native filters and collections
-            
-            # Recently Added (using Plex's method)
+            lib_id    = section['id']
+            lib_title = section['title']
+
+            # Recently Added
             categories.append({
-                'id': f"{base_id}",
-                'name': f"🆕 Recently Added - {section.title}",
-                'type': 'plex_recently_added',
-                'section_id': section.key,
-                'limit': 50
+                'id': str(base_id), 'name': f"🆕 Recently Added - {lib_title}",
+                'type': 'plex_recently_added', 'section_id': lib_id, 'limit': 50
             })
             base_id += 1
-            
-            # Get all unique genres from the section
-            try:
-                genres = set()
-                for movie in section.search(limit=500):  # Sample more for better genre detection
-                    if movie.genres:
-                        for genre in movie.genres:
-                            genres.add(genre.tag)
-                
-                # Create a category for each genre using Plex's genre filter
-                for genre in sorted(genres):
-                    categories.append({
-                        'id': f"{base_id}",
-                        'name': f"🎭 {genre} - {section.title}",
-                        'type': 'plex_genre',
-                        'section_id': section.key,
-                        'genre': genre,
-                        'limit': 200
-                    })
-                    base_id += 1
-            except Exception as e:
-                print(f"Error getting genres: {e}")
-            
-            # Get all unique decades
-            try:
-                decades = set()
-                for movie in section.search(limit=500):
-                    if movie.year:
-                        decade = (movie.year // 10) * 10
-                        decades.add(decade)
-                
-                # Create decade categories
-                for decade in sorted(decades, reverse=True):
-                    if decade >= 1920:  # Only decades from 1920 onwards
-                        categories.append({
-                            'id': f"{base_id}",
-                            'name': f"📅 {decade}s - {section.title}",
-                            'type': 'plex_decade',
-                            'section_id': section.key,
-                            'decade': decade,
-                            'limit': 200
-                        })
-                        base_id += 1
-            except Exception as e:
-                print(f"Error getting decades: {e}")
-            
-            # Get Plex Collections (if any)
-            try:
-                collections = section.collections()
-                for collection in collections:
-                    categories.append({
-                        'id': f"{base_id}",
-                        'name': f"📚 {collection.title}",
-                        'type': 'plex_collection',
-                        'section_id': section.key,
-                        'collection_id': collection.ratingKey,
-                        'limit': 200
-                    })
-                    base_id += 1
-            except Exception as e:
-                print(f"Error getting collections: {e}")
-        
+
+            # Genres
+            for genre in media_client.get_genres(lib_id, 'movie'):
+                categories.append({
+                    'id': str(base_id), 'name': f"🎭 {genre} - {lib_title}",
+                    'type': 'plex_genre', 'section_id': lib_id, 'genre': genre, 'limit': 200
+                })
+                base_id += 1
+
+            # Decades
+            for decade in media_client.get_decades(lib_id, 'movie'):
+                categories.append({
+                    'id': str(base_id), 'name': f"📅 {decade}s - {lib_title}",
+                    'type': 'plex_decade', 'section_id': lib_id, 'decade': decade, 'limit': 200
+                })
+                base_id += 1
+
+            # Collections
+            for col in media_client.get_collections(lib_id):
+                categories.append({
+                    'id': str(base_id), 'name': f"📚 {col['title']}",
+                    'type': 'plex_collection', 'section_id': lib_id,
+                    'collection_id': col['id'], 'limit': 200
+                })
+                base_id += 1
+
     except Exception as e:
         print(f"Error generating movie categories: {e}")
-    
+
     return categories
 
 def get_smart_categories_for_series():
-    """Generate smart categories for TV shows using Plex metadata"""
+    """Generate smart categories for TV shows using PlexClient."""
     categories = []
-    base_id = 20000
-    
-    if not plex:
+    base_id    = 20000
+
+    if not media_client:
         return categories
-    
+
     try:
-        # Get all TV sections
-        tv_sections = [s for s in plex.library.sections() if s.type == 'show']
-        
+        tv_sections = [s for s in get_cached_sections() if s['type'] == 'show']
+
         for section in tv_sections:
-            # Recently Added (using Plex's method)
+            lib_id    = section['id']
+            lib_title = section['title']
+
+            # Recently Added
             categories.append({
-                'id': f"{base_id}",
-                'name': f"🆕 Recently Added - {section.title}",
-                'type': 'plex_recently_added',
-                'section_id': section.key,
-                'limit': 50
+                'id': str(base_id), 'name': f"🆕 Recently Added - {lib_title}",
+                'type': 'plex_recently_added', 'section_id': lib_id, 'limit': 50
             })
             base_id += 1
-            
-            # Get all unique genres
-            try:
-                genres = set()
-                for show in section.search(limit=500):
-                    if show.genres:
-                        for genre in show.genres:
-                            genres.add(genre.tag)
-                
-                # Create genre categories using Plex's genre filter
-                for genre in sorted(genres):
+
+            # Genres
+            for genre in media_client.get_genres(lib_id, 'show'):
+                categories.append({
+                    'id': str(base_id), 'name': f"🎭 {genre} - {lib_title}",
+                    'type': 'plex_genre', 'section_id': lib_id, 'genre': genre, 'limit': 200
+                })
+                base_id += 1
+
+            # Decades (1950+)
+            for decade in media_client.get_decades(lib_id, 'show'):
+                if decade >= 1950:
                     categories.append({
-                        'id': f"{base_id}",
-                        'name': f"🎭 {genre} - {section.title}",
-                        'type': 'plex_genre',
-                        'section_id': section.key,
-                        'genre': genre,
-                        'limit': 200
+                        'id': str(base_id), 'name': f"📅 {decade}s - {lib_title}",
+                        'type': 'plex_decade', 'section_id': lib_id, 'decade': decade, 'limit': 200
                     })
                     base_id += 1
-            except Exception as e:
-                print(f"Error getting genres: {e}")
-            
-            # Get all unique decades
-            try:
-                decades = set()
-                for show in section.search(limit=500):
-                    if show.year:
-                        decade = (show.year // 10) * 10
-                        decades.add(decade)
-                
-                # Create decade categories
-                for decade in sorted(decades, reverse=True):
-                    if decade >= 1950:  # Only decades from 1950 onwards for TV
-                        categories.append({
-                            'id': f"{base_id}",
-                            'name': f"📅 {decade}s - {section.title}",
-                            'type': 'plex_decade',
-                            'section_id': section.key,
-                            'decade': decade,
-                            'limit': 200
-                        })
-                        base_id += 1
-            except Exception as e:
-                print(f"Error getting decades: {e}")
-            
-            # Get Plex Collections
-            try:
-                collections = section.collections()
-                for collection in collections:
-                    categories.append({
-                        'id': f"{base_id}",
-                        'name': f"📚 {collection.title}",
-                        'type': 'plex_collection',
-                        'section_id': section.key,
-                        'collection_id': collection.ratingKey,
-                        'limit': 200
-                    })
-                    base_id += 1
-            except Exception as e:
-                print(f"Error getting collections: {e}")
-        
+
+            # Collections
+            for col in media_client.get_collections(lib_id):
+                categories.append({
+                    'id': str(base_id), 'name': f"📚 {col['title']}",
+                    'type': 'plex_collection', 'section_id': lib_id,
+                    'collection_id': col['id'], 'limit': 200
+                })
+                base_id += 1
+
     except Exception as e:
         print(f"Error generating series categories: {e}")
-    
+
     return categories
 
 def get_movies_for_category(category):
-    """Get movies for a specific category using Plex filters"""
+    """Get movies for a specific category using PlexClient."""
     movies = []
-    
-    if not plex:
+    if not media_client:
         return movies
-    
+
+    lib_id = category['section_id']
+    limit  = category.get('limit', 200)
+
     try:
-        section = plex.library.sectionByID(int(category['section_id']))
-        
-        if category['type'] == 'plex_recently_added':
-            # Use Plex's native recently added
-            items = section.recentlyAdded(maxresults=category.get('limit', 50))
-        
-        elif category['type'] == 'plex_unwatched':
-            # Movies never played — viewCount=0
-            items = section.search(unwatched=True, limit=category.get('limit', 200))
-        
-        elif category['type'] == 'plex_genre':
-            # Use Plex's genre filter
-            items = section.search(genre=category['genre'], limit=category.get('limit', 200))
-        
-        elif category['type'] == 'plex_decade':
-            # Filter by decade
-            decade = category['decade']
-            items = section.search(
-                **{'year>>': decade, 'year<<': decade + 9},
-                limit=category.get('limit', 200)
-            )
-        
-        elif category['type'] == 'plex_collection':
-            # Get items from Plex collection
-            try:
-                collection = plex.fetchItem(int(category['collection_id']))
-                items = collection.items()[:category.get('limit', 200)]
-            except:
-                items = []
-        
-        elif category['type'] == 'custom':
-            # Custom filter
-            items = section.search(**category.get('filters', {}), limit=category.get('limit', 50))
-        
+        cat_type = category['type']
+        if cat_type == 'plex_recently_added':
+            items = media_client.get_recently_added(lib_id, limit)
+            items = [i for i in items if i['type'] == 'movie']
+        elif cat_type == 'plex_unwatched':
+            items = media_client.get_unwatched_movies(lib_id, limit)
+        elif cat_type == 'plex_genre':
+            items = media_client.get_by_genre(lib_id, category['genre'], 'movie', limit)
+        elif cat_type == 'plex_decade':
+            items = media_client.get_by_decade(lib_id, category['decade'], 'movie', limit)
+        elif cat_type == 'plex_collection':
+            items = media_client.get_collection_items(category['collection_id'], 'movie')[:limit]
         else:
             items = []
-        
-        for movie in items:
-            formatted = format_movie_for_xtream(movie, category['id'])
+
+        for item in items:
+            formatted = format_movie_for_xtream(item, category['id'])
             if formatted:
                 movies.append(formatted)
-    
+
     except Exception as e:
         print(f"Error getting movies for category: {e}")
-    
+
     return movies
 
+
 def get_series_for_category(category):
-    """Get TV shows for a specific category using Plex filters"""
+    """Get TV shows for a specific category using PlexClient."""
     series = []
-    
-    if not plex:
+    if not media_client:
         return series
-    
+
+    lib_id = category['section_id']
+    limit  = category.get('limit', 200)
+
     try:
-        section = plex.library.sectionByID(int(category['section_id']))
-        
-        if category['type'] == 'plex_recently_added':
-            # Use Plex's native recently added
-            items = section.recentlyAdded(maxresults=category.get('limit', 50))
-        
-        elif category['type'] == 'plex_unwatched':
-            # Shows with no episodes watched at all
-            items = section.search(unwatched=True, limit=category.get('limit', 200))
-        
-        elif category['type'] == 'plex_genre':
-            # Use Plex's genre filter
-            items = section.search(genre=category['genre'], limit=category.get('limit', 200))
-        
-        elif category['type'] == 'plex_decade':
-            # Filter by decade
-            decade = category['decade']
-            items = section.search(
-                **{'year>>': decade, 'year<<': decade + 9},
-                limit=category.get('limit', 200)
-            )
-        
-        elif category['type'] == 'plex_collection':
-            # Get items from Plex collection
-            try:
-                collection = plex.fetchItem(int(category['collection_id']))
-                items = collection.items()[:category.get('limit', 200)]
-            except:
-                items = []
-        
-        elif category['type'] == 'custom':
-            items = section.search(**category.get('filters', {}), limit=category.get('limit', 50))
-        
+        cat_type = category['type']
+        if cat_type == 'plex_recently_added':
+            items = media_client.get_recently_added(lib_id, limit)
+            items = [i for i in items if i['type'] == 'show']
+        elif cat_type == 'plex_unwatched':
+            items = media_client.get_unwatched_shows(lib_id, limit)
+        elif cat_type == 'plex_genre':
+            items = media_client.get_by_genre(lib_id, category['genre'], 'show', limit)
+        elif cat_type == 'plex_decade':
+            items = media_client.get_by_decade(lib_id, category['decade'], 'show', limit)
+        elif cat_type == 'plex_collection':
+            items = media_client.get_collection_items(category['collection_id'], 'show')[:limit]
         else:
             items = []
-        
-        for show in items:
-            formatted = format_series_for_xtream(show, category['id'])
+
+        for item in items:
+            formatted = format_series_for_xtream(item, category['id'])
             if formatted:
                 series.append(formatted)
-    
+
     except Exception as e:
         print(f"Error getting series for category: {e}")
-    
+
     return series
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1279,8 +1799,8 @@ def get_series_for_category(category):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_on_deck_movies(limit=None):
-    """Return in-progress movies from Plex On Deck for the admin account."""
-    if not plex:
+    """Return in-progress movies from On Deck using PlexClient."""
+    if not media_client:
         return []
 
     max_items = limit or ON_DECK_LIMIT
@@ -1288,26 +1808,23 @@ def get_on_deck_movies(limit=None):
     seen      = set()
 
     try:
-        for item in plex.library.onDeck():
+        for item in media_client.get_on_deck(max_items * 2):
             if len(movies) >= max_items:
                 break
-            if item.type != 'movie':
+            if item['type'] != 'movie':
                 continue
-            if item.ratingKey in seen:
+            if item['id'] in seen:
                 continue
-            seen.add(item.ratingKey)
+            seen.add(item['id'])
 
             formatted = format_movie_for_xtream(item, ON_DECK_MOVIE_CAT_ID)
             if formatted:
-                try:
-                    view_offset = getattr(item, 'viewOffset', 0) or 0
-                    duration    = getattr(item, 'duration',   0) or 0
-                    if duration > 0:
-                        formatted['progress']      = round(view_offset / duration * 100)
-                        formatted['view_offset']   = view_offset // 1000
-                        formatted['duration_secs'] = duration    // 1000
-                except Exception:
-                    pass
+                view_offset = item.get('view_offset', 0) or 0
+                duration    = item.get('duration', 0) or 0
+                if duration > 0:
+                    formatted['progress']      = round(view_offset / duration * 100)
+                    formatted['view_offset']   = view_offset // 1000
+                    formatted['duration_secs'] = duration    // 1000
                 movies.append(formatted)
     except Exception as e:
         print(f"[ON_DECK] Error fetching movies: {e}")
@@ -1317,12 +1834,8 @@ def get_on_deck_movies(limit=None):
 
 
 def get_on_deck_series(limit=None):
-    """
-    Return TV shows with in-progress episodes from Plex On Deck.
-    onDeck() returns individual episodes; each is walked back to its
-    parent show and deduplicated so each series appears at most once.
-    """
-    if not plex:
+    """Return TV shows with in-progress episodes from On Deck using PlexClient."""
+    if not media_client:
         return []
 
     max_items = limit or ON_DECK_LIMIT
@@ -1330,33 +1843,29 @@ def get_on_deck_series(limit=None):
     seen      = set()
 
     try:
-        for item in plex.library.onDeck():
+        for item in media_client.get_on_deck(max_items * 2):
             if len(series) >= max_items:
                 break
-            if item.type != 'episode':
+            if item['type'] != 'episode':
                 continue
 
-            try:
-                show = item.show()
-            except Exception:
+            show = media_client.get_show_for_episode(item)
+            if not show:
                 continue
 
-            if show.ratingKey in seen:
+            if show['id'] in seen:
                 continue
-            seen.add(show.ratingKey)
+            seen.add(show['id'])
 
             formatted = format_series_for_xtream(show, ON_DECK_SERIES_CAT_ID)
             if formatted:
-                try:
-                    formatted['next_episode_title']  = item.title
-                    formatted['next_episode_season'] = item.seasonNumber
-                    formatted['next_episode_num']    = item.index
-                    view_offset = getattr(item, 'viewOffset', 0) or 0
-                    duration    = getattr(item, 'duration',   0) or 0
-                    if duration > 0:
-                        formatted['next_episode_progress'] = round(view_offset / duration * 100)
-                except Exception:
-                    pass
+                formatted['next_episode_title']  = item.get('title', '')
+                formatted['next_episode_season'] = item.get('season_number')
+                formatted['next_episode_num']    = item.get('episode_number')
+                view_offset = item.get('view_offset', 0) or 0
+                duration    = item.get('duration', 0) or 0
+                if duration > 0:
+                    formatted['next_episode_progress'] = round(view_offset / duration * 100)
                 series.append(formatted)
     except Exception as e:
         print(f"[ON_DECK] Error fetching series: {e}")
@@ -1367,7 +1876,7 @@ def get_on_deck_series(limit=None):
 
 # Load config and connect on startup
 load_config()
-connect_plex()
+connect_server()
 load_category_filters()
 
 # Session storage
@@ -1444,66 +1953,60 @@ def _get_live_stats():
     """Assemble the full stats payload for the dashboard."""
     cleanup_inactive_streams()
 
-    # TMDb cache sizes
     cached_movies = len(session_cache.get('movies', {}))
     cached_series = len(session_cache.get('series', {}))
 
-    # Library sizes (fast — uses cached sections where possible)
     total_movies = 0
     total_shows  = 0
     try:
-        if plex:
-            for section in plex.library.sections():
-                if section.type == 'movie':
-                    total_movies += section.totalViewSize()
-                elif section.type == 'show':
-                    total_shows  += section.totalViewSize()
+        if media_client:
+            for section in get_cached_sections():
+                if section['type'] == 'movie':
+                    total_movies += media_client.total_view_size(section['id'], 'movie')
+                elif section['type'] == 'show':
+                    total_shows  += media_client.total_view_size(section['id'], 'show')
     except Exception:
         pass
 
-    # Active streams detail
     active = []
     for stream in active_streams.values():
         try:
-            item = plex.fetchItem(int(stream['stream_id']))
-            title = item.title
+            item  = media_client.get_item(stream['stream_id']) if media_client else None
+            title = item['title'] if item else f"ID {stream['stream_id']}"
         except Exception:
             title = f"ID {stream['stream_id']}"
         active.append({
-            'user':       stream['username'],
-            'title':      title,
-            'type':       stream['stream_type'],
-            'started':    datetime.fromtimestamp(stream['started_at']).strftime('%H:%M:%S'),
-            'duration':   int((time.time() - stream['started_at']) / 60)
+            'user':     stream['username'],
+            'title':    title,
+            'type':     stream['stream_type'],
+            'started':  datetime.fromtimestamp(stream['started_at']).strftime('%H:%M:%S'),
+            'duration': int((time.time() - stream['started_at']) / 60)
         })
 
     with _stats_lock:
-        hits   = bridge_stats['tmdb_cache_hits']
-        misses = bridge_stats['tmdb_cache_misses']
+        hits          = bridge_stats['tmdb_cache_hits']
+        misses        = bridge_stats['tmdb_cache_misses']
         total_lookups = hits + misses
-        hit_rate = round(hits / total_lookups * 100) if total_lookups > 0 else None
+        hit_rate      = round(hits / total_lookups * 100) if total_lookups > 0 else None
 
         return {
-            'uptime':            _get_uptime_str(),
-            'total_requests':    bridge_stats['total_requests'],
-            'requests_by_action': dict(sorted(
-                bridge_stats['requests_by_action'].items(),
-                key=lambda x: x[1], reverse=True
-            )),
-            'total_streams':     bridge_stats['total_streams'],
-            'streams_by_type':   bridge_stats['streams_by_type'],
-            'active_streams':    active,
-            'active_user_count': len(set(s['username'] for s in active_streams.values())),
-            'cached_movies':     cached_movies,
-            'cached_series':     cached_series,
-            'total_movies':      total_movies,
-            'total_shows':       total_shows,
-            'tmdb_enabled':      bool(TMDB_API_KEY),
-            'tmdb_cache_hits':   hits,
-            'tmdb_cache_misses': misses,
+            'uptime':             _get_uptime_str(),
+            'total_requests':     bridge_stats['total_requests'],
+            'requests_by_action': dict(sorted(bridge_stats['requests_by_action'].items(), key=lambda x: x[1], reverse=True)),
+            'total_streams':      bridge_stats['total_streams'],
+            'streams_by_type':    bridge_stats['streams_by_type'],
+            'active_streams':     active,
+            'active_user_count':  len(set(s['username'] for s in active_streams.values())),
+            'cached_movies':      cached_movies,
+            'cached_series':      cached_series,
+            'total_movies':       total_movies,
+            'total_shows':        total_shows,
+            'tmdb_enabled':       bool(TMDB_API_KEY),
+            'tmdb_cache_hits':    hits,
+            'tmdb_cache_misses':  misses,
             'tmdb_total_lookups': total_lookups,
-            'tmdb_hit_rate':     hit_rate,
-            'recent_activity':   list(reversed(bridge_stats['recent_activity'])),
+            'tmdb_hit_rate':      hit_rate,
+            'recent_activity':    list(reversed(bridge_stats['recent_activity'])),
         }
 
 def authenticate(username, password):
@@ -1561,195 +2064,137 @@ def validate_session():
     return False
 
 def get_stream_url(item, session_info=""):
-    """Generate stream URL for Plex item"""
-    media = item.media[0] if item.media else None
-    if not media:
-        return None
-    
-    part = media.parts[0] if media.parts else None
-    if not part:
-        return None
-    
-    base_url = PLEX_URL.rstrip('/')
-    # Use direct file access - this works reliably
-    stream_url = f"{base_url}{part.key}?X-Plex-Token={PLEX_TOKEN}"
-    
-    return stream_url
+    """Return stream URL from a normalized item dict."""
+    if media_client:
+        return media_client.get_stream_url(item)
+    return None
 
-def format_movie_for_xtream(movie, category_id=1, skip_tmdb=False):
-    """Format Plex movie to Xtream Codes format - with TMDb posters"""
+
+def format_movie_for_xtream(item, category_id=1, skip_tmdb=False):
+    """Format a normalized movie dict to Xtream Codes format."""
     try:
-        stream_url = get_stream_url(movie)
+        stream_url = get_stream_url(item)
         if not stream_url:
             return None
-        
-        # Get TMDb data for high-quality posters (with caching)
+
+        # TMDb enrichment with caching
         tmdb_data = None
         if TMDB_API_KEY and not skip_tmdb:
-            cache_key = f"movie_{movie.ratingKey}"
-
+            cache_key = f"movie_{item['id']}"
             if cache_key in session_cache['movies']:
                 tmdb_data = session_cache['movies'][cache_key]
                 _record_tmdb_lookup(hit=True)
             else:
                 _record_tmdb_lookup(hit=False)
-                tmdb_data = enhance_movie_with_tmdb(movie)
+                tmdb_data = enhance_movie_with_tmdb(item)
                 if tmdb_data:
                     session_cache['movies'][cache_key] = tmdb_data
-        
-        # Use TMDb posters if available, otherwise Plex
-        if tmdb_data and tmdb_data.get('poster_path'):
-            poster_url = tmdb_data['poster_path']
-        else:
-            try:
-                poster_url = movie.thumbUrl if hasattr(movie, 'thumbUrl') else ""
-                if not poster_url and hasattr(movie, 'thumb'):
-                    poster_url = f"{PLEX_URL}{movie.thumb}?X-Plex-Token={PLEX_TOKEN}"
-            except:
-                poster_url = ""
-        
-        # Use TMDb backdrop if available, otherwise Plex
-        if tmdb_data and tmdb_data.get('backdrop_path'):
-            backdrop_url = tmdb_data['backdrop_path']
-        else:
-            try:
-                backdrop_url = movie.artUrl if hasattr(movie, 'artUrl') else ""
-                if not backdrop_url and hasattr(movie, 'art'):
-                    backdrop_url = f"{PLEX_URL}{movie.art}?X-Plex-Token={PLEX_TOKEN}"
-            except:
-                backdrop_url = ""
-        
-        # Format with TMDb posters - multiple field names for compatibility
-        formatted = {
-            "stream_id": movie.ratingKey,
-            "num": movie.ratingKey,
-            "name": movie.title,
-            # Multiple poster field names for different apps
-            "stream_icon": poster_url,
-            "icon": poster_url,
-            "cover": poster_url,
-            "poster": poster_url,
-            "image": poster_url,
-            # Backdrop fields
-            "cover_big": backdrop_url,
-            "backdrop": backdrop_url,
-            "fanart": backdrop_url,
-            "added": str(int(movie.addedAt.timestamp())) if hasattr(movie, 'addedAt') and movie.addedAt else "",
-            "category_id": str(category_id),
-            "container_extension": "mkv",
-            "direct_source": stream_url,
-            # Year for better matching
-            "year": str(movie.year) if hasattr(movie, 'year') and movie.year else "",
-            "releaseDate": str(movie.year) if hasattr(movie, 'year') and movie.year else "",
-            # TMDb match status
-            "tmdb_matched": bool(tmdb_data)
+
+        poster_url   = (tmdb_data or {}).get('poster_path')   or item.get('thumb', '')
+        backdrop_url = (tmdb_data or {}).get('backdrop_path') or item.get('art', '')
+        year_str     = str(item['year']) if item.get('year') else ''
+
+        return {
+            "stream_id":          item['id'],
+            "num":                item['id'],
+            "name":               item.get('title', ''),
+            "stream_icon":        poster_url,
+            "icon":               poster_url,
+            "cover":              poster_url,
+            "poster":             poster_url,
+            "image":              poster_url,
+            "cover_big":          backdrop_url,
+            "backdrop":           backdrop_url,
+            "fanart":             backdrop_url,
+            "added":              str(item.get('added_at', '')),
+            "category_id":        str(category_id),
+            "container_extension": item.get('media_parts', [{}])[0].get('container', 'mkv'),
+            "direct_source":      stream_url,
+            "year":               year_str,
+            "releaseDate":        year_str,
+            "tmdb_matched":       bool(tmdb_data),
         }
-        
-        return formatted
     except Exception as e:
+        print(f"[FORMAT] Error formatting movie: {e}")
         return None
 
-def format_series_for_xtream(show, category_id=2):
-    """Format Plex TV show to Xtream Codes format - with TMDb posters"""
+
+def format_series_for_xtream(item, category_id=2):
+    """Format a normalized show dict to Xtream Codes format."""
     try:
-        # Get TMDb data for high-quality posters (with caching)
+        # TMDb enrichment with caching
         tmdb_data = None
         if TMDB_API_KEY:
-            cache_key = f"series_{show.ratingKey}"
-
+            cache_key = f"series_{item['id']}"
             if cache_key in session_cache['series']:
                 tmdb_data = session_cache['series'][cache_key]
                 _record_tmdb_lookup(hit=True)
             else:
                 _record_tmdb_lookup(hit=False)
-                tmdb_data = enhance_series_with_tmdb(show)
+                tmdb_data = enhance_series_with_tmdb(item)
                 if tmdb_data:
                     session_cache['series'][cache_key] = tmdb_data
-        
-        # Use TMDb posters if available, otherwise Plex
-        if tmdb_data and tmdb_data.get('poster_path'):
-            poster_url = tmdb_data['poster_path']
-        else:
-            try:
-                poster_url = show.thumbUrl if hasattr(show, 'thumbUrl') else ""
-                if not poster_url and hasattr(show, 'thumb'):
-                    poster_url = f"{PLEX_URL}{show.thumb}?X-Plex-Token={PLEX_TOKEN}"
-            except:
-                poster_url = ""
-        
-        # Use TMDb backdrop if available, otherwise Plex
-        if tmdb_data and tmdb_data.get('backdrop_path'):
-            backdrop_url = tmdb_data['backdrop_path']
-        else:
-            try:
-                backdrop_url = show.artUrl if hasattr(show, 'artUrl') else ""
-                if not backdrop_url and hasattr(show, 'art'):
-                    backdrop_url = f"{PLEX_URL}{show.art}?X-Plex-Token={PLEX_TOKEN}"
-            except:
-                backdrop_url = ""
-        
-        # Full metadata with TMDb posters - multiple field names for compatibility
-        formatted = {
-            "series_id": show.ratingKey,
-            "num": show.ratingKey,
-            "name": show.title,
-            # Multiple poster field names for different apps
-            "cover": poster_url,
-            "poster": poster_url,
-            "image": poster_url,
-            "icon": poster_url,
-            # Backdrop fields
-            "cover_big": backdrop_url,
-            "backdrop": backdrop_url,
-            "fanart": backdrop_url,
-            "plot": show.summary if hasattr(show, 'summary') else "",
-            "cast": ", ".join([actor.tag for actor in show.roles[:10]]) if hasattr(show, 'roles') and show.roles else "",
-            "director": ", ".join([d.tag for d in show.directors]) if hasattr(show, 'directors') and show.directors else "",
-            "genre": ", ".join([g.tag for g in show.genres]) if hasattr(show, 'genres') and show.genres else "",
-            "releaseDate": str(show.year) if hasattr(show, 'year') and show.year else "",
-            "year": str(show.year) if hasattr(show, 'year') and show.year else "",
-            "rating": str(show.rating) if hasattr(show, 'rating') and show.rating else "0",
-            "rating_5based": round(float(show.rating or 0) / 2, 1) if hasattr(show, 'rating') else 0,
+
+        poster_url   = (tmdb_data or {}).get('poster_path')   or item.get('thumb', '')
+        backdrop_url = (tmdb_data or {}).get('backdrop_path') or item.get('art', '')
+        year_str     = str(item['year']) if item.get('year') else ''
+        rating       = item.get('rating') or 0
+
+        return {
+            "series_id":    item['id'],
+            "num":          item['id'],
+            "name":         item.get('title', ''),
+            "cover":        poster_url,
+            "poster":       poster_url,
+            "image":        poster_url,
+            "icon":         poster_url,
+            "cover_big":    backdrop_url,
+            "backdrop":     backdrop_url,
+            "fanart":       backdrop_url,
+            "plot":         item.get('summary', ''),
+            "cast":         ", ".join(item.get('roles', [])),
+            "director":     ", ".join(item.get('directors', [])),
+            "genre":        ", ".join(item.get('genres', [])),
+            "releaseDate":  year_str,
+            "year":         year_str,
+            "rating":       str(rating),
+            "rating_5based": round(float(rating) / 2, 1),
             "backdrop_path": [backdrop_url] if backdrop_url else [],
-            "category_id": str(category_id),
-            # TMDb match status
-            "tmdb_matched": bool(tmdb_data)
+            "category_id":  str(category_id),
+            "tmdb_matched": bool(tmdb_data),
         }
-        
-        return formatted
     except Exception as e:
-        return None
-        print(f"Error formatting series {show.title}: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[FORMAT] Error formatting series: {e}")
         return None
 
-def format_episode_for_xtream(episode, series_id):
-    """Format Plex episode to Xtream Codes format"""
+
+def format_episode_for_xtream(item, series_id):
+    """Format a normalized episode dict to Xtream Codes format."""
     try:
-        stream_url = get_stream_url(episode)
+        stream_url = get_stream_url(item)
         if not stream_url:
             return None
-            
+
+        duration = item.get('duration', 0) or 0
         return {
-            "id": episode.ratingKey,
-            "episode_num": episode.index,
-            "title": episode.title,
-            "container_extension": "mkv",
+            "id":                  item['id'],
+            "episode_num":         item.get('episode_number'),
+            "title":               item.get('title', ''),
+            "container_extension": item.get('media_parts', [{}])[0].get('container', 'mkv'),
             "info": {
-                "tmdb_id": "",
-                "releasedate": episode.originallyAvailableAt.strftime("%Y-%m-%d") if episode.originallyAvailableAt else "",
-                "plot": episode.summary or "",
-                "duration_secs": str(episode.duration // 1000) if episode.duration else "0",
-                "duration": str(episode.duration // 60000) if episode.duration else "0",
-                "rating": str(episode.rating) if episode.rating else "0",
-                "season": episode.seasonNumber,
-                "cover_big": f"{PLEX_URL}{episode.thumb}?X-Plex-Token={PLEX_TOKEN}" if episode.thumb else ""
+                "tmdb_id":      "",
+                "releasedate":  item.get('air_date', ''),
+                "plot":         item.get('summary', ''),
+                "duration_secs": str(duration // 1000),
+                "duration":      str(duration // 60000),
+                "rating":        str(item.get('rating', '0') or '0'),
+                "season":        item.get('season_number'),
+                "cover_big":     item.get('thumb', ''),
             },
-            "direct_source": stream_url
+            "direct_source": stream_url,
         }
     except Exception as e:
-        print(f"Error formatting episode {episode.title}: {e}")
+        print(f"[FORMAT] Error formatting episode: {e}")
         return None
 
 # Web Interface Templates
@@ -1951,14 +2396,14 @@ DASHBOARD_HTML = """
     <div class="container">
         <div class="header">
             <h1>🎬 Plex Xtream Bridge</h1>
-            <p>Connect your Plex library to any Xtream UI player</p>
+            <p>Connect your Plex, Emby, or Jellyfin library to any Xtream UI player</p>
         </div>
         
         <div class="status-card">
             <h2 style="margin-bottom: 20px;">System Status</h2>
             <div class="status-grid">
                 <div class="status-item">
-                    <h3>Plex Server</h3>
+                    <h3>Media Server</h3>
                     <p>
                         {% if plex_connected %}
                         <span class="status-badge status-connected">✓ Connected</span>
@@ -1998,8 +2443,8 @@ DASHBOARD_HTML = """
             
             <div style="display: grid; gap: 15px;">
                 <div style="background: #f8f9fa; padding: 20px; border-radius: 10px; border-left: 4px solid #667eea;">
-                    <h3 style="margin-bottom: 10px; color: #333; font-size: 16px;">1️⃣ Configure Plex Connection</h3>
-                    <p style="color: #666; margin-bottom: 10px;">Go to Settings and enter your Plex server URL and token.</p>
+                    <h3 style="margin-bottom: 10px; color: #333; font-size: 16px;">1️⃣ Configure Media Server Connection</h3>
+                    <p style="color: #666; margin-bottom: 10px;">Go to Settings and enter your media server URL and token.</p>
                     {% if not plex_connected %}
                     <a href="/admin/settings" class="button" style="display: inline-block; font-size: 14px; padding: 8px 16px;">Configure Now</a>
                     {% else %}
@@ -2243,24 +2688,64 @@ SETTINGS_HTML = """
         
         <form method="POST" action="/admin/settings">
             <div class="card">
-                <h2>Plex Server Configuration</h2>
-                
+                <h2>Media Server</h2>
+
                 <div class="form-group">
-                    <label for="plex_url">Plex Server URL</label>
-                    <input type="text" id="plex_url" name="plex_url" value="{{ plex_url }}" placeholder="http://192.168.1.100:32400" required>
-                    <small>The URL of your Plex Media Server (include http:// or https://)</small>
+                    <label for="server_type">Server Type</label>
+                    <select id="server_type" name="server_type" onchange="showServerFields(this.value)"
+                            style="width:100%;padding:12px;border:2px solid #e1e4e8;border-radius:8px;font-size:14px;">
+                        <option value="plex"      {% if server_type == 'plex'      %}selected{% endif %}>Plex</option>
+                        <option value="jellyfin"  {% if server_type == 'jellyfin'  %}selected{% endif %}>Jellyfin</option>
+                        <option value="emby"      {% if server_type == 'emby'      %}selected{% endif %}>Emby</option>
+                    </select>
                 </div>
-                
-                <div class="form-group">
-                    <label for="plex_token">Plex Token</label>
-                    <input type="text" id="plex_token" name="plex_token" value="{{ plex_token }}" placeholder="Your Plex authentication token" required>
-                    <small>Get from Plex Web: Play media → Get Info → View XML → Copy X-Plex-Token</small>
+
+                <!-- Plex fields -->
+                <div id="plex-fields">
+                    <div class="form-group">
+                        <label for="plex_url">Plex Server URL</label>
+                        <input type="text" id="plex_url" name="plex_url" value="{{ plex_url }}" placeholder="http://192.168.1.100:32400">
+                        <small>Include http:// or https://</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="plex_token">Plex Token</label>
+                        <input type="text" id="plex_token" name="plex_token" value="{{ plex_token }}" placeholder="Your Plex authentication token">
+                        <small>Plex Web → Play media → Get Info → View XML → Copy X-Plex-Token</small>
+                    </div>
                 </div>
-                
+
+                <!-- Emby / Jellyfin fields -->
+                <div id="emby-fields" style="display:none;">
+                    <div class="form-group">
+                        <label for="emby_url">Server URL</label>
+                        <input type="text" id="emby_url" name="emby_url" value="{{ emby_url }}" placeholder="http://192.168.1.100:8096">
+                        <small>Include http:// or https:// and the port</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="emby_api_key">API Key</label>
+                        <input type="text" id="emby_api_key" name="emby_api_key" value="{{ emby_api_key }}" placeholder="Your API key">
+                        <small>Dashboard → Advanced → API Keys → New API Key</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="emby_user_id">User ID</label>
+                        <div style="display:flex;gap:8px;align-items:flex-start;">
+                            <div style="flex:1;">
+                                <input type="text" id="emby_user_id" name="emby_user_id" value="{{ emby_user_id }}" placeholder="User ID (GUID)">
+                                <small>The user whose watch history and library is used</small>
+                            </div>
+                            <button type="button" onclick="discoverUsers()"
+                                    style="padding:12px 16px;background:#28a745;color:white;border:none;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px;">
+                                🔍 Discover
+                            </button>
+                        </div>
+                        <div id="user-list" style="margin-top:8px;display:none;border:1px solid #e1e4e8;border-radius:8px;overflow:hidden;"></div>
+                    </div>
+                </div>
+
                 <div class="form-group">
                     <label for="tmdb_api_key">TMDb API Key (Optional)</label>
                     <input type="text" id="tmdb_api_key" name="tmdb_api_key" value="{{ tmdb_api_key }}" placeholder="Your TMDb API key for enhanced metadata">
-                    <small>Get free API key from <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a> - enables better categorization</small>
+                    <small>Get free API key from <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a></small>
                 </div>
             </div>
             
@@ -2318,6 +2803,56 @@ SETTINGS_HTML = """
             </div>
         </form>
     </div>
+
+<script>
+function showServerFields(type) {
+    document.getElementById('plex-fields').style.display  = (type === 'plex')  ? '' : 'none';
+    document.getElementById('emby-fields').style.display  = (type !== 'plex')  ? '' : 'none';
+}
+
+function discoverUsers() {
+    const url     = document.getElementById('emby_url').value.trim();
+    const api_key = document.getElementById('emby_api_key').value.trim();
+    const flavour = document.getElementById('server_type').value;
+    const list    = document.getElementById('user-list');
+
+    if (!url || !api_key) {
+        alert('Enter the server URL and API key first.');
+        return;
+    }
+
+    list.style.display = 'block';
+    list.innerHTML     = '<div style="padding:10px;color:#666;">Discovering users…</div>';
+
+    fetch(`/admin/discover-users?url=${encodeURIComponent(url)}&api_key=${encodeURIComponent(api_key)}&flavour=${flavour}`)
+        .then(r => r.json())
+        .then(d => {
+            if (d.success && d.users.length > 0) {
+                list.innerHTML = d.users.map(u =>
+                    `<div onclick="selectUser('${u.id}','${u.name}')"
+                          style="padding:10px 14px;cursor:pointer;border-bottom:1px solid #f0f0f0;font-size:14px;"
+                          onmouseover="this.style.background='#f8f9fa'" onmouseout="this.style.background=''">
+                        <strong>${u.name}</strong>
+                        <span style="color:#999;font-size:12px;margin-left:8px;">${u.id}</span>
+                    </div>`
+                ).join('');
+            } else {
+                list.innerHTML = `<div style="padding:10px;color:#dc3545;">${d.error || 'No users found'}</div>`;
+            }
+        })
+        .catch(e => {
+            list.innerHTML = `<div style="padding:10px;color:#dc3545;">Error: ${e}</div>`;
+        });
+}
+
+function selectUser(id, name) {
+    document.getElementById('emby_user_id').value = id;
+    document.getElementById('user-list').style.display = 'none';
+}
+
+// Show correct fields on page load
+showServerFields(document.getElementById('server_type').value);
+</script>
 </body>
 </html>
 """
@@ -3351,27 +3886,21 @@ def tmdb_matcher():
     unmatched_movies = []
     unmatched_shows = []
     
-    if plex:
-        # Check movies
-        for section in plex.library.sections():
-            if section.type == 'movie':
-                for movie in section.all():
-                    cache_key = f"movie_{movie.ratingKey}"
+    unmatched_movies = []
+    unmatched_shows  = []
+
+    if media_client:
+        for section in get_cached_sections():
+            if section['type'] == 'movie':
+                for item in media_client.get_all_movies(section['id']):
+                    cache_key = f"movie_{item['id']}"
                     if cache_key not in session_cache['movies']:
-                        unmatched_movies.append({
-                            'id': movie.ratingKey,
-                            'title': movie.title,
-                            'year': movie.year if hasattr(movie, 'year') else ''
-                        })
-            elif section.type == 'show':
-                for show in section.all():
-                    cache_key = f"series_{show.ratingKey}"
+                        unmatched_movies.append({'id': item['id'], 'title': item.get('title', ''), 'year': item.get('year', '')})
+            elif section['type'] == 'show':
+                for item in media_client.get_all_shows(section['id']):
+                    cache_key = f"series_{item['id']}"
                     if cache_key not in session_cache['series']:
-                        unmatched_shows.append({
-                            'id': show.ratingKey,
-                            'title': show.title,
-                            'year': show.year if hasattr(show, 'year') else ''
-                        })
+                        unmatched_shows.append({'id': item['id'], 'title': item.get('title', ''), 'year': item.get('year', '')})
     
     # Pagination calculations
     total_movies = len(unmatched_movies)
@@ -3782,35 +4311,29 @@ def search_plex_api():
         return jsonify({"results": []})
     
     results = []
-    
+
     try:
-        for section in plex.library.sections():
-            plex_type = 'movie' if content_type == 'movie' else 'show'
-            if section.type == plex_type:
-                # Search in this section
-                for item in section.all():
-                    if query in item.title.lower():
-                        # Check if already matched
-                        cache_key = f"{content_type}_{item.ratingKey}" if content_type == 'movie' else f"series_{item.ratingKey}"
-                        cache_category = 'movies' if content_type == 'movie' else 'series'
-                        matched = cache_key in session_cache[cache_category]
-                        
-                        results.append({
-                            'id': item.ratingKey,
-                            'title': item.title,
-                            'year': item.year if hasattr(item, 'year') else '',
-                            'matched': matched
-                        })
-                        
-                        if len(results) >= 20:  # Limit to 20 results
-                            break
-            
+        for section in get_cached_sections():
+            if section['type'] != ('movie' if content_type == 'movie' else 'show'):
+                continue
+            items = media_client.search(section['id'], query, content_type) if media_client else []
+            for item in items[:20]:
+                cache_key      = f"{'movie' if content_type == 'movie' else 'series'}_{item['id']}"
+                cache_category = 'movies' if content_type == 'movie' else 'series'
+                results.append({
+                    'id':      item['id'],
+                    'title':   item.get('title', ''),
+                    'year':    item.get('year', ''),
+                    'matched': cache_key in session_cache[cache_category]
+                })
+                if len(results) >= 20:
+                    break
             if len(results) >= 20:
                 break
-        
+
         return jsonify({"results": results})
     except Exception as e:
-        print(f"[ERROR] Plex search error: {e}")
+        print(f"[ERROR] Search error: {e}")
         return jsonify({"results": []})
 
 @app.route('/admin/match-content', methods=['POST'])
@@ -3872,26 +4395,29 @@ def admin_logout_old():
 @require_admin_login
 def admin_dashboard():
     """Admin dashboard"""
-    libraries = []
+    libraries   = []
     server_name = "Not connected"
-    
-    if plex:
-        server_name = plex.friendlyName
-        for section in plex.library.sections():
+
+    if media_client:
+        server_name = media_client.server_name
+        for section in get_cached_sections():
+            try:
+                count = media_client.total_view_size(section['id'], section['type'])
+            except Exception:
+                count = 0
             libraries.append({
-                'name': section.title,
-                'type': section.type.title(),
-                'count': len(section.all())
+                'name':  section['title'],
+                'type':  section['type'].title(),
+                'count': count
             })
-    
-    # Get server IP
+
     import socket
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
+    hostname  = socket.gethostname()
+    local_ip  = socket.gethostbyname(hostname)
     bridge_url = f"http://{local_ip}:{BRIDGE_PORT}"
-    
+
     return render_template_string(DASHBOARD_HTML,
-        plex_connected=plex is not None,
+        plex_connected=media_client is not None,
         tmdb_configured=bool(TMDB_API_KEY),
         server_name=server_name,
         bridge_url=bridge_url,
@@ -3904,55 +4430,59 @@ def admin_dashboard():
 @app.route('/admin/settings', methods=['GET', 'POST'])
 @require_admin_login
 def admin_settings():
-    """Settings page"""
-    global PLEX_URL, PLEX_TOKEN, BRIDGE_USERNAME, BRIDGE_PASSWORD, ADMIN_PASSWORD, SHOW_DUMMY_CHANNEL, TMDB_API_KEY
-    
+    """Settings page — supports Plex, Emby, and Jellyfin."""
+    global PLEX_URL, PLEX_TOKEN, SERVER_TYPE, EMBY_URL, EMBY_API_KEY, EMBY_USER_ID
+    global BRIDGE_USERNAME, BRIDGE_PASSWORD, ADMIN_PASSWORD, SHOW_DUMMY_CHANNEL, TMDB_API_KEY
+
     message = None
-    error = False
-    
+    error   = False
+
     if request.method == 'POST':
-        # Get form data
-        new_plex_url = request.form.get('plex_url', '').strip()
-        new_plex_token = request.form.get('plex_token', '').strip()
-        new_bridge_username = request.form.get('bridge_username', '').strip()
-        new_bridge_password = request.form.get('bridge_password', '').strip()
-        new_admin_password = request.form.get('admin_password', '').strip()
-        new_tmdb_key = request.form.get('tmdb_api_key', '').strip()
-        new_show_dummy = request.form.get('show_dummy_channel') == 'on'
-        
-        # Validate inputs
-        if not new_bridge_username or not new_bridge_password:
-            message = "✗ Bridge username and password cannot be empty"
-            error = True
-        elif not new_admin_password:
-            message = "✗ Admin password cannot be empty"
-            error = True
+        new_server_type = request.form.get('server_type', 'plex').strip()
+        new_plex_url    = request.form.get('plex_url', '').strip()
+        new_plex_token  = request.form.get('plex_token', '').strip()
+        new_emby_url    = request.form.get('emby_url', '').strip()
+        new_emby_key    = request.form.get('emby_api_key', '').strip()
+        new_emby_uid    = request.form.get('emby_user_id', '').strip()
+        new_bridge_user = request.form.get('bridge_username', '').strip()
+        new_bridge_pass = request.form.get('bridge_password', '').strip()
+        new_admin_pass  = request.form.get('admin_password', '').strip()
+        new_tmdb_key    = request.form.get('tmdb_api_key', '').strip()
+        new_show_dummy  = request.form.get('show_dummy_channel') == 'on'
+
+        if not new_bridge_user or not new_bridge_pass:
+            message, error = "✗ Bridge username and password cannot be empty", True
+        elif not new_admin_pass:
+            message, error = "✗ Admin password cannot be empty", True
         else:
-            # Update global variables
-            PLEX_URL = new_plex_url
-            PLEX_TOKEN = new_plex_token
-            BRIDGE_USERNAME = new_bridge_username
-            BRIDGE_PASSWORD = new_bridge_password
-            ADMIN_PASSWORD = new_admin_password
-            TMDB_API_KEY = new_tmdb_key
+            SERVER_TYPE        = new_server_type
+            PLEX_URL           = new_plex_url
+            PLEX_TOKEN         = new_plex_token
+            EMBY_URL           = new_emby_url
+            EMBY_API_KEY       = new_emby_key
+            EMBY_USER_ID       = new_emby_uid
+            BRIDGE_USERNAME    = new_bridge_user
+            BRIDGE_PASSWORD    = new_bridge_pass
+            ADMIN_PASSWORD     = new_admin_pass
+            TMDB_API_KEY       = new_tmdb_key
             SHOW_DUMMY_CHANNEL = new_show_dummy
-            
+
             if save_config():
-                if PLEX_URL and PLEX_TOKEN:
-                    if connect_plex():
-                        message = "✓ Settings saved and connected to Plex successfully!"
-                    else:
-                        message = "⚠️ Settings saved but failed to connect to Plex. Check your URL and token."
-                        error = True
+                if connect_server():
+                    message = f"✓ Settings saved and connected to {SERVER_TYPE.title()} successfully!"
                 else:
-                    message = "✓ Settings saved! Add Plex URL and token to connect to your server."
+                    message = f"⚠️ Settings saved but failed to connect to {SERVER_TYPE.title()}. Check your credentials."
+                    error   = True
             else:
-                message = "✗ Failed to save settings"
-                error = True
-    
+                message, error = "✗ Failed to save settings", True
+
     return render_template_string(SETTINGS_HTML,
+        server_type=SERVER_TYPE,
         plex_url=PLEX_URL,
         plex_token=PLEX_TOKEN,
+        emby_url=EMBY_URL,
+        emby_api_key=EMBY_API_KEY,
+        emby_user_id=EMBY_USER_ID,
         bridge_username=BRIDGE_USERNAME,
         bridge_password=BRIDGE_PASSWORD,
         admin_password=ADMIN_PASSWORD,
@@ -3962,30 +4492,50 @@ def admin_settings():
         error=error
     )
 
+
+@app.route('/admin/discover-users')
+@require_admin_login
+def discover_users():
+    """Return user list from Emby/Jellyfin for the setup UI."""
+    url     = request.args.get('url', '').strip()
+    api_key = request.args.get('api_key', '').strip()
+    flavour = request.args.get('flavour', 'jellyfin')
+
+    if not url or not api_key:
+        return jsonify({'success': False, 'error': 'URL and API key required'}), 400
+
+    try:
+        client = EmbyJellyfinClient(url, api_key, '', flavour)
+        users  = client.get_users()
+        return jsonify({'success': True, 'users': users})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/admin/test')
 @require_admin_login
 def admin_test():
-    """Test Plex connection"""
-    if connect_plex():
+    """Test media server connection."""
+    if connect_server():
         return jsonify({
-            "success": True,
-            "message": f"Successfully connected to {plex.friendlyName}",
-            "version": plex.version,
-            "libraries": [s.title for s in plex.library.sections()]
+            "success":   True,
+            "message":   f"Successfully connected to {media_client.server_name if media_client else 'server'}",
+            "version":   "",
+            "libraries": [s['title'] for s in get_cached_sections()]
         })
-    else:
-        return jsonify({
-            "success": False,
-            "message": "Failed to connect to Plex. Check your URL and token."
-        }), 500
+    return jsonify({
+        "success": False,
+        "message": f"Failed to connect to {SERVER_TYPE.title()}. Check your credentials."
+    }), 500
+
 
 # Xtream Codes API Endpoints (keeping all previous API code)
 
 @app.route('/player_api.php')
 def player_api():
     """Main Xtream Codes API endpoint"""
-    if not plex:
-        return jsonify({"error": "Plex server not connected"}), 500
+    if not media_client:
+        return jsonify({"error": "Media server not connected"}), 500
     
     action = request.args.get('action')
     username = request.args.get('username')
@@ -4041,7 +4591,8 @@ def player_api():
                 # ── Continue Watching (movies) ──────────────────────────────
                 try:
                     has_movie_deck = any(
-                        i.type == 'movie' for i in plex.library.onDeck()
+                        i['type'] == 'movie'
+                        for i in (media_client.get_on_deck() if media_client else [])
                     )
                 except Exception:
                     has_movie_deck = False
@@ -4064,10 +4615,10 @@ def player_api():
                 # ── Regular library sections ────────────────────────────────
                 sections = get_cached_sections()
                 for section in sections:
-                    if section.type == 'movie':
+                    if section['type'] == 'movie':
                         categories.append({
-                            "category_id":   str(section.key),
-                            "category_name": section.title,
+                            "category_id":   str(section['id']),
+                            "category_name": section["title"],
                             "parent_id": 0
                         })
 
@@ -4107,8 +4658,8 @@ def player_api():
             try:
                 max_limit = limit if limit > 0 else MAX_MOVIES
                 for section in get_cached_sections():
-                    if section.type == 'movie':
-                        for movie in section.search(unwatched=True, limit=max_limit):
+                    if section['type'] == 'movie' and media_client:
+                        for movie in media_client.get_unwatched_movies(section['id'], max_limit):
                             formatted = format_movie_for_xtream(movie, UNWATCHED_MOVIE_CAT_ID)
                             if formatted:
                                 movies.append(formatted)
@@ -4120,26 +4671,20 @@ def player_api():
 
         # Handle "All Movies" category (category_id = "0")
         if category_id == "0" or not category_id:
-            # No category specified or "All" - return all movies (with limit)
-            max_limit = limit if limit > 0 else MAX_MOVIES  # Use environment variable
-            count = 0
-            
-            sections = get_cached_sections()
-            for section in sections:
-                if section.type == 'movie':
-                    # Use search() instead of all() for better performance
+            max_limit = limit if limit > 0 else MAX_MOVIES
+            count     = 0
+            for section in get_cached_sections():
+                if section['type'] == 'movie' and media_client:
                     try:
-                        for movie in section.search():
+                        for movie in media_client.get_all_movies(section['id']):
                             if count >= max_limit:
                                 break
-                            # Fetch TMDb for high-quality posters (cached)
-                            formatted = format_movie_for_xtream(movie, section.key, skip_tmdb=False)
+                            formatted = format_movie_for_xtream(movie, section['id'])
                             if formatted:
                                 movies.append(formatted)
                                 count += 1
                     except Exception as e:
                         print(f"[ERROR] Error iterating movies: {e}")
-                
                 if count >= max_limit:
                     break
         elif category_id:
@@ -4165,17 +4710,14 @@ def player_api():
                 else:
                     # Regular Plex library category
                     try:
-                        section = plex.library.sectionByID(int(category_id))
-                        all_movies = section.all()
-                        
-                        # Apply limit if specified
-                        movies_to_process = all_movies[:limit] if limit > 0 else all_movies
-                        
-                        for movie in movies_to_process:
-                            # Fetch TMDb for high-quality posters (cached)
-                            formatted = format_movie_for_xtream(movie, category_id, skip_tmdb=False)
-                            if formatted:
-                                movies.append(formatted)
+                        section = next((s for s in get_cached_sections() if str(s["id"]) == str(category_id)), None)
+                        if section and media_client:
+                            all_movies = media_client.get_all_movies(section['id'])
+                            movies_to_process = all_movies[:limit] if limit > 0 else all_movies
+                            for movie in movies_to_process:
+                                formatted = format_movie_for_xtream(movie, category_id)
+                                if formatted:
+                                    movies.append(formatted)
                     except Exception as e:
                         print(f"[ERROR] Error getting movies: {e}")
         
@@ -4195,45 +4737,46 @@ def player_api():
         track_stream_start(username, vod_id, 'movie')
         
         try:
-            movie = plex.fetchItem(int(vod_id))
+            movie = media_client.get_item(vod_id) if media_client else None
+            if not movie:
+                return jsonify({"error": "Item not found"}), 404
             stream_url = get_stream_url(movie)
-            
-            # Get TMDb enhanced metadata
+
             tmdb_data = enhance_movie_with_tmdb(movie) if TMDB_API_KEY else {}
-            
+
             info = {
                 "info": {
-                    "tmdb_id": str(tmdb_data.get('tmdb_id', '')) if tmdb_data else "",
-                    "imdb_id": tmdb_data.get('imdb_id', '') if tmdb_data else "",
-                    "name": movie.title,
-                    "o_name": movie.originalTitle or movie.title,
-                    "cover_big": tmdb_data.get('backdrop_path', '') if tmdb_data else (f"{PLEX_URL}{movie.art}?X-Plex-Token={PLEX_TOKEN}" if movie.art else ""),
-                    "movie_image": tmdb_data.get('poster_path', '') if tmdb_data else (f"{PLEX_URL}{movie.thumb}?X-Plex-Token={PLEX_TOKEN}" if movie.thumb else ""),
-                    "releasedate": str(movie.year) if movie.year else "",
+                    "tmdb_id":        str(tmdb_data.get('tmdb_id', '')) if tmdb_data else "",
+                    "imdb_id":        tmdb_data.get('imdb_id', '') if tmdb_data else "",
+                    "name":           movie.get('title', ''),
+                    "o_name":         movie.get('original_title', movie.get('title', '')),
+                    "cover_big":      tmdb_data.get('backdrop_path', '') if tmdb_data else movie.get('art', ''),
+                    "movie_image":    tmdb_data.get('poster_path', '') if tmdb_data else movie.get('thumb', ''),
+                    "releasedate":    str(movie.get('year', '')) if movie.get('year') else "",
                     "youtube_trailer": tmdb_data.get('trailer', '') if tmdb_data else "",
-                    "director": tmdb_data.get('director', '') if tmdb_data else (", ".join([d.tag for d in movie.directors]) if movie.directors else ""),
-                    "actors": ', '.join([c['name'] for c in tmdb_data.get('cast', [])]) if tmdb_data and tmdb_data.get('cast') else (", ".join([a.tag for a in movie.roles[:10]]) if movie.roles else ""),
-                    "cast": ', '.join([c['name'] for c in tmdb_data.get('cast', [])]) if tmdb_data and tmdb_data.get('cast') else (", ".join([a.tag for a in movie.roles[:10]]) if movie.roles else ""),
-                    "description": tmdb_data.get('overview', '') if tmdb_data else (movie.summary or ""),
-                    "plot": tmdb_data.get('overview', '') if tmdb_data else (movie.summary or ""),
-                    "age": movie.contentRating or "",
-                    "rating": str(tmdb_data.get('vote_average', movie.rating or 0)),
-                    "rating_5based": tmdb_data.get('vote_average', round(float(movie.rating or 0) / 2, 1)),
-                    "duration_secs": str(movie.duration // 1000) if movie.duration else "0",
-                    "duration": str(movie.duration // 60000) if movie.duration else "0",
-                    "genre": ', '.join(tmdb_data.get('genres', [])) if tmdb_data else (", ".join([g.tag for g in movie.genres]) if movie.genres else ""),
-                    "backdrop_path": [tmdb_data.get('backdrop_path')] if tmdb_data and tmdb_data.get('backdrop_path') else ([f"{PLEX_URL}{movie.art}?X-Plex-Token={PLEX_TOKEN}"] if movie.art else []),
-                    "popularity": tmdb_data.get('popularity', 0) if tmdb_data else 0,
-                    "vote_count": tmdb_data.get('vote_count', 0) if tmdb_data else 0,
-                    "tagline": tmdb_data.get('tagline', '') if tmdb_data else "",
-                    "keywords": ', '.join(tmdb_data.get('keywords', [])) if tmdb_data else ""
+                    "director":       tmdb_data.get('director', '') if tmdb_data else ", ".join(movie.get('directors', [])),
+                    "actors":         ', '.join([c['name'] for c in tmdb_data.get('cast', [])]) if tmdb_data and tmdb_data.get('cast') else ", ".join(movie.get('roles', [])),
+                    "cast":           ', '.join([c['name'] for c in tmdb_data.get('cast', [])]) if tmdb_data and tmdb_data.get('cast') else ", ".join(movie.get('roles', [])),
+                    "description":    tmdb_data.get('overview', '') if tmdb_data else movie.get('summary', ''),
+                    "plot":           tmdb_data.get('overview', '') if tmdb_data else movie.get('summary', ''),
+                    "age":            movie.get('content_rating', ''),
+                    "rating":         str(tmdb_data.get('vote_average', movie.get('rating') or 0)),
+                    "rating_5based":  tmdb_data.get('vote_average', round(float(movie.get('rating') or 0) / 2, 1)),
+                    "duration_secs":  str((movie.get('duration') or 0) // 1000),
+                    "duration":       str((movie.get('duration') or 0) // 60000),
+                    "genre":          ', '.join(tmdb_data.get('genres', [])) if tmdb_data else ", ".join(movie.get('genres', [])),
+                    "backdrop_path":  [tmdb_data['backdrop_path']] if tmdb_data and tmdb_data.get('backdrop_path') else ([movie.get('art', '')] if movie.get('art') else []),
+                    "popularity":     tmdb_data.get('popularity', 0) if tmdb_data else 0,
+                    "vote_count":     tmdb_data.get('vote_count', 0) if tmdb_data else 0,
+                    "tagline":        tmdb_data.get('tagline', '') if tmdb_data else "",
+                    "keywords":       ', '.join(tmdb_data.get('keywords', [])) if tmdb_data else "",
                 },
                 "movie_data": {
-                    "stream_id": movie.ratingKey,
-                    "name": movie.title,
-                    "container_extension": "mkv",
-                    "custom_sid": "",
-                    "direct_source": stream_url
+                    "stream_id":          movie['id'],
+                    "name":               movie.get('title', ''),
+                    "container_extension": movie.get('media_parts', [{}])[0].get('container', 'mkv'),
+                    "custom_sid":         "",
+                    "direct_source":      stream_url
                 }
             }
             return jsonify(info)
@@ -4249,7 +4792,8 @@ def player_api():
                 # ── Continue Watching (TV shows) ────────────────────────────
                 try:
                     has_episode_deck = any(
-                        i.type == 'episode' for i in plex.library.onDeck()
+                        i['type'] == 'episode'
+                        for i in (media_client.get_on_deck() if media_client else [])
                     )
                 except Exception:
                     has_episode_deck = False
@@ -4272,10 +4816,10 @@ def player_api():
                 # ── Regular library sections ────────────────────────────────
                 sections = get_cached_sections()
                 for section in sections:
-                    if section.type == 'show':
+                    if section['type'] == 'show':
                         categories.append({
-                            "category_id":   str(section.key),
-                            "category_name": section.title,
+                            "category_id":   str(section['id']),
+                            "category_name": section["title"],
                             "parent_id": 0
                         })
 
@@ -4315,8 +4859,8 @@ def player_api():
             try:
                 max_limit = limit if limit > 0 else MAX_SHOWS
                 for section in get_cached_sections():
-                    if section.type == 'show':
-                        for show in section.search(unwatched=True, limit=max_limit):
+                    if section['type'] == 'show' and media_client:
+                        for show in media_client.get_unwatched_shows(section['id'], max_limit):
                             formatted = format_series_for_xtream(show, UNWATCHED_SERIES_CAT_ID)
                             if formatted:
                                 series_list.append(formatted)
@@ -4328,26 +4872,22 @@ def player_api():
 
         # Handle "All Series" category (category_id = "0")
         if category_id == "0" or not category_id:
-            # No category specified or "All" - return all series (with limit)
             max_limit = limit if limit > 0 else MAX_SHOWS
             print(f"[DEBUG] Returning all series from all sections (max {max_limit})")
             count = 0
-            
-            sections = get_cached_sections()
-            for section in sections:
-                if section.type == 'show':
-                    print(f"[DEBUG] Processing TV section: {section.title}")
+            for section in get_cached_sections():
+                if section['type'] == 'show' and media_client:
+                    print(f"[DEBUG] Processing TV section: {section['title']}")
                     try:
-                        for show in section.search():
+                        for show in media_client.get_all_shows(section['id']):
                             if count >= max_limit:
                                 break
-                            formatted = format_series_for_xtream(show, section.key)
+                            formatted = format_series_for_xtream(show, section['id'])
                             if formatted:
                                 series_list.append(formatted)
                                 count += 1
                     except Exception as e:
                         print(f"[ERROR] Error iterating shows: {e}")
-                
                 if count >= max_limit:
                     break
         elif category_id:
@@ -4375,41 +4915,37 @@ def player_api():
                 else:
                     # Regular Plex library category
                     try:
-                        section = plex.library.sectionByID(int(category_id))
-                        print(f"[DEBUG] Using Plex section: {section.title}")
-                        all_shows = section.all()
-                        
-                        # Apply limit if specified
-                        shows_to_process = all_shows[:limit] if limit > 0 else all_shows
-                        
-                        for show in shows_to_process:
-                            formatted = format_series_for_xtream(show, category_id)
-                            if formatted:
-                                series_list.append(formatted)
+                        section = next((s for s in get_cached_sections() if str(s["id"]) == str(category_id)), None)
+                        if section and media_client:
+                            print(f"[DEBUG] Using section: {section['title']}")
+                            all_shows = media_client.get_all_shows(section['id'])
+                            shows_to_process = all_shows[:limit] if limit > 0 else all_shows
+                            for show in shows_to_process:
+                                formatted = format_series_for_xtream(show, category_id)
+                                if formatted:
+                                    series_list.append(formatted)
                     except Exception as e:
                         print(f"[ERROR] Error getting series: {e}")
         else:
-            # No category specified - return all series (with optional limit)
-            # Default to 300 max to prevent timeout
+            # No category specified - return all series
             max_limit = limit if limit > 0 else MAX_SHOWS
             print(f"[DEBUG] Returning all series from all sections (max {max_limit})")
             count = 0
-            
-            sections = get_cached_sections()
-            for section in sections:
-                if section.type == 'show':
-                    print(f"[DEBUG] Processing TV section: {section.title}")
+
+            for section in get_cached_sections():
+                if section['type'] == 'show':
+                    print(f"[DEBUG] Processing TV section: {section['title']}")
                     try:
-                        for show in section.search():
+                        for show in media_client.get_all_shows(section['id']):
                             if count >= max_limit:
                                 break
-                            formatted = format_series_for_xtream(show, section.key)
+                            formatted = format_series_for_xtream(show, section['id'])
                             if formatted:
                                 series_list.append(formatted)
                                 count += 1
                     except Exception as e:
                         print(f"[ERROR] Error iterating shows: {e}")
-                
+
                 if count >= max_limit:
                     break
         
@@ -4424,12 +4960,12 @@ def player_api():
         # Check if there are any Live TV sections in Plex
         has_plex_livetv = False
         try:
-            for section in plex.library.sections():
-                if section.type == 'livetv':
+            for section in get_cached_sections():
+                if section['type'] == 'livetv':
                     has_plex_livetv = True
                     categories.append({
-                        "category_id": section.key,
-                        "category_name": section.title,
+                        "category_id":   section['id'],
+                        "category_name": section["title"],
                         "parent_id": 0
                     })
         except:
@@ -4453,11 +4989,9 @@ def player_api():
         # Check for real Plex Live TV
         has_plex_livetv = False
         try:
-            for section in plex.library.sections():
-                if section.type == 'livetv':
+            for section in get_cached_sections():
+                if section['type'] == 'livetv':
                     has_plex_livetv = True
-                    # Here you could add real live TV channels from Plex
-                    # For now, we'll leave it empty if they exist
         except:
             pass
         
@@ -4481,8 +5015,8 @@ def player_api():
             
             # Optionally add more informational "channels"
             if plex:
-                movie_count = sum(1 for s in plex.library.sections() if s.type == 'movie')
-                show_count = sum(1 for s in plex.library.sections() if s.type == 'show')
+                movie_count = sum(1 for s in get_cached_sections() if s.type == 'movie')
+                show_count = sum(1 for s in get_cached_sections() if s.type == 'show')
                 
                 streams.append({
                     "num": 2,
@@ -4527,98 +5061,72 @@ def player_api():
         
         try:
             print(f"[DEBUG] Attempting to fetch series ID: {series_id}")
-            
-            # Try to fetch the item
-            try:
-                show = plex.fetchItem(int(series_id))
-            except Exception as fetch_error:
-                print(f"[ERROR] Failed to fetch item {series_id}: {fetch_error}")
-                # Return empty structure instead of 404
-                return jsonify({
-                    "seasons": [],
-                    "info": {
-                        "name": f"Series {series_id}",
-                        "cover": "",
-                        "plot": "Unable to load series information",
-                        "cast": "",
-                        "director": "",
-                        "genre": "",
-                        "releaseDate": "",
-                        "rating": "0",
-                        "rating_5based": 0,
-                        "backdrop_path": [],
-                        "youtube_trailer": "",
-                        "episode_run_time": "",
-                        "category_id": "2"
-                    },
-                    "episodes": {}
-                })
-            
-            print(f"[DEBUG] Getting series info for: {show.title} (Type: {show.type})")
-            
-            # Check if it's actually a show
-            if show.type != 'show':
-                print(f"[WARNING] Item {series_id} is not a show, it's a {show.type}")
-                return jsonify({"error": f"Item is not a TV show, it's a {show.type}"}), 400
-            
-            seasons = []
+
+            show = media_client.get_item(series_id) if media_client else None
+            if not show:
+                return jsonify({"seasons": [], "info": {"name": f"Series {series_id}", "cover": "", "plot": "Unable to load series information", "cast": "", "director": "", "genre": "", "releaseDate": "", "rating": "0", "rating_5based": 0, "backdrop_path": [], "youtube_trailer": "", "episode_run_time": "", "category_id": "2"}, "episodes": {}})
+
+            print(f"[DEBUG] Getting series info for: {show.get('title')} (type: {show.get('type')})")
+
+            if show.get('type') != 'show':
+                return jsonify({"error": f"Item is not a TV show, it's a {show.get('type')}"}), 400
+
+            seasons       = []
             episodes_data = {}
-            
-            for season in show.seasons():
-                season_num = season.seasonNumber
+
+            for season in media_client.get_seasons(series_id):
+                season_num = season.get('season_number')
                 if season_num is None:
                     print(f"[DEBUG] Skipping season with no number")
                     continue
-                
-                print(f"[DEBUG] Processing season {season_num}: {season.title}")
-                    
+
+                print(f"[DEBUG] Processing season {season_num}: {season.get('title')}")
+
+                ep_list = media_client.get_episodes(season['id'])
                 season_info = {
-                    "air_date": str(season.year) if hasattr(season, 'year') and season.year else "",
-                    "episode_count": len(season.episodes()),
-                    "id": season.ratingKey,
-                    "name": season.title,
-                    "overview": season.summary or "",
+                    "air_date":      str(season.get('year', '')),
+                    "episode_count": len(ep_list),
+                    "id":            season['id'],
+                    "name":          season.get('title', ''),
+                    "overview":      season.get('summary', ''),
                     "season_number": season_num,
-                    "cover": f"{PLEX_URL}{season.thumb}?X-Plex-Token={PLEX_TOKEN}" if season.thumb else "",
-                    "cover_big": f"{PLEX_URL}{season.art}?X-Plex-Token={PLEX_TOKEN}" if hasattr(season, 'art') and season.art else ""
+                    "cover":         season.get('thumb', ''),
+                    "cover_big":     season.get('art', ''),
                 }
-                
                 seasons.append(season_info)
-                
+
                 episodes = []
-                for episode in season.episodes():
+                for episode in ep_list:
                     formatted_episode = format_episode_for_xtream(episode, series_id)
                     if formatted_episode:
                         episodes.append(formatted_episode)
-                
+
                 print(f"[DEBUG] Season {season_num} has {len(episodes)} episodes")
-                
                 if episodes:
-                    # Use string key for JSON compatibility
                     episodes_data[str(season_num)] = episodes
-            
+
             print(f"[DEBUG] Total seasons: {len(seasons)}, Total episode groups: {len(episodes_data)}")
-            
+
+            rating = show.get('rating') or 0
             info = {
                 "seasons": seasons,
                 "info": {
-                    "name": show.title,
-                    "cover": f"{PLEX_URL}{show.thumb}?X-Plex-Token={PLEX_TOKEN}" if hasattr(show, 'thumb') and show.thumb else "",
-                    "plot": show.summary if hasattr(show, 'summary') else "",
-                    "cast": ", ".join([actor.tag for actor in show.roles[:10]]) if hasattr(show, 'roles') and show.roles else "",
-                    "director": ", ".join([d.tag for d in show.directors]) if hasattr(show, 'directors') and show.directors else "",
-                    "genre": ", ".join([g.tag for g in show.genres]) if hasattr(show, 'genres') and show.genres else "",
-                    "releaseDate": str(show.year) if hasattr(show, 'year') and show.year else "",
-                    "rating": str(show.rating) if hasattr(show, 'rating') and show.rating else "0",
-                    "rating_5based": round(float(show.rating or 0) / 2, 1) if hasattr(show, 'rating') else 0,
-                    "backdrop_path": [f"{PLEX_URL}{show.art}?X-Plex-Token={PLEX_TOKEN}"] if hasattr(show, 'art') and show.art else [],
-                    "youtube_trailer": "",
+                    "name":             show.get('title', ''),
+                    "cover":            show.get('thumb', ''),
+                    "plot":             show.get('summary', ''),
+                    "cast":             ", ".join(show.get('roles', [])),
+                    "director":         ", ".join(show.get('directors', [])),
+                    "genre":            ", ".join(show.get('genres', [])),
+                    "releaseDate":      str(show.get('year', '')) if show.get('year') else "",
+                    "rating":           str(rating),
+                    "rating_5based":    round(float(rating) / 2, 1),
+                    "backdrop_path":    [show.get('art', '')] if show.get('art') else [],
+                    "youtube_trailer":  "",
                     "episode_run_time": "",
-                    "category_id": "2"
+                    "category_id":      "2"
                 },
                 "episodes": episodes_data
             }
-            
             return jsonify(info)
         except Exception as e:
             print(f"[ERROR] Error getting series info: {e}")
@@ -4658,7 +5166,7 @@ def stream_movie(username, password, stream_id):
     track_stream_start(username, stream_id, 'movie')
     
     try:
-        movie = plex.fetchItem(int(stream_id))
+        movie = media_client.get_item(stream_id) if media_client else None
         stream_url = get_stream_url(movie)
         if stream_url:
             return Response(
@@ -4682,23 +5190,17 @@ def stream_episode(username, password, stream_id):
     
     try:
         print(f"[STREAM] Fetching episode ID: {stream_id}")
-        episode = plex.fetchItem(int(stream_id))
-        print(f"[STREAM] Found episode: {episode.title} (S{episode.seasonNumber}E{episode.index})")
-        
-        stream_url = get_stream_url(episode)
+        episode = media_client.get_item(stream_id) if media_client else None
+        if episode:
+            print(f"[STREAM] Found episode: {episode.get('title')} (S{episode.get('season_number')}E{episode.get('episode_number')})")
+        stream_url = get_stream_url(episode) if episode else None
         if stream_url:
             print(f"[STREAM] Redirecting to: {stream_url[:100]}...")
-            return Response(
-                status=302,
-                headers={'Location': stream_url}
-            )
-        
+            return Response(status=302, headers={'Location': stream_url})
         print(f"[ERROR] No stream URL generated for episode {stream_id}")
         return "Stream not found", 404
     except Exception as e:
         print(f"[ERROR] Error streaming episode {stream_id}: {e}")
-        import traceback
-        traceback.print_exc()
         return str(e), 404
 
 @app.route('/admin/category-editor')
@@ -4911,10 +5413,10 @@ def view_category_contents(category_type, category_id):
     # Check Plex library categories
     if not category and plex:
         try:
-            section = plex.library.sectionByID(int(category_id))
+            section = next((s for s in get_cached_sections() if str(s["id"]) == str(category_id)), None)
             category = {
                 'id': category_id,
-                'name': f"📁 {section.title}",
+                'name': f"📁 {section["title"]}",
                 'type': 'plex_library',
                 'section_id': category_id
             }
@@ -4927,42 +5429,22 @@ def view_category_contents(category_type, category_id):
     # Get content for this category
     if category_type == 'movie':
         if category['type'] == 'plex_library':
-            # Get all movies from library
             try:
-                section = plex.library.sectionByID(int(category_id))
-                items = section.all()
+                section = next((s for s in get_cached_sections() if str(s["id"]) == str(category_id)), None)
+                items = media_client.get_all_movies(section['id']) if section and media_client else []
             except:
                 items = []
         else:
-            # Get from category function
-            temp_items = get_movies_for_category(category)
-            # Extract just the titles and IDs
-            items = []
-            for formatted in temp_items:
-                try:
-                    movie = plex.fetchItem(int(formatted['stream_id']))
-                    items.append(movie)
-                except:
-                    pass
+            items = get_movies_for_category(category)
     else:
         if category['type'] == 'plex_library':
-            # Get all shows from library
             try:
-                section = plex.library.sectionByID(int(category_id))
-                items = section.all()
+                section = next((s for s in get_cached_sections() if str(s["id"]) == str(category_id)), None)
+                items = media_client.get_all_shows(section['id']) if section and media_client else []
             except:
                 items = []
         else:
-            # Get from category function
-            temp_items = get_series_for_category(category)
-            # Extract just the titles and IDs
-            items = []
-            for formatted in temp_items:
-                try:
-                    show = plex.fetchItem(int(formatted['series_id']))
-                    items.append(show)
-                except:
-                    pass
+            items = get_series_for_category(category)
     
     # Build HTML
     category_view_html = f"""
@@ -5098,17 +5580,12 @@ def view_category_contents(category_type, category_id):
 """
     
     # Add items
-    for item in items[:200]:  # Limit to 200 for performance
+    for item in items[:200]:
         try:
-            title = item.title
-            year = item.year if hasattr(item, 'year') and item.year else 'N/A'
-            rating = round(item.rating, 1) if hasattr(item, 'rating') and item.rating else 'N/A'
-            
-            # Get poster
-            if hasattr(item, 'thumb') and item.thumb:
-                poster = f"{PLEX_URL}{item.thumb}?X-Plex-Token={PLEX_TOKEN}"
-            else:
-                poster = ""
+            title  = item.get('title', '') if isinstance(item, dict) else str(item)
+            year   = item.get('year', 'N/A') if isinstance(item, dict) else 'N/A'
+            rating = item.get('rating', 'N/A') if isinstance(item, dict) else 'N/A'
+            poster = item.get('thumb', '') if isinstance(item, dict) else ''
             
             category_view_html += f"""
                 <div class="item-card" data-title="{title.lower()}">
