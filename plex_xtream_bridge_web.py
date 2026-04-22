@@ -1547,7 +1547,6 @@ def get_full_category_state():
 
     for media_type, fn in (('movies', get_smart_categories_for_movies),
                            ('series', get_smart_categories_for_series)):
-        # Special categories
         for cat in SPECIAL_CATEGORY_DEFS[media_type]:
             result[media_type]['special'].append({
                 'id':      cat['id'],
@@ -1555,7 +1554,6 @@ def get_full_category_state():
                 'enabled': is_category_enabled(cat['id'], media_type),
             })
 
-        # Smart categories (genres, decades, collections, recently added)
         try:
             for cat in fn():
                 result[media_type]['smart'].append({
@@ -1567,6 +1565,53 @@ def get_full_category_state():
             print(f"[CATEGORIES] Error building {media_type} smart list: {e}")
 
     return result
+
+
+def get_category_count(cat_id, media_type):
+    """
+    Return the number of items in a given category.
+    Used by the /admin/categories/count endpoint to populate
+    counts in the UI without blocking the initial page load.
+    """
+    if not media_client:
+        return None
+
+    cat_id_str = str(cat_id)
+
+    # ── Special categories ───────────────────────────────────────────────
+    if cat_id_str == ON_DECK_MOVIE_CAT_ID:
+        return len(get_on_deck_movies())
+    if cat_id_str == ON_DECK_SERIES_CAT_ID:
+        return len(get_on_deck_series())
+    if cat_id_str == UNWATCHED_MOVIE_CAT_ID:
+        total = 0
+        for s in get_cached_sections():
+            if s['type'] == 'movie':
+                total += media_client.total_view_size(s['id'], 'unwatched_movie') \
+                         if hasattr(media_client, 'total_unwatched_size') \
+                         else len(media_client.get_unwatched_movies(s['id']))
+        return total
+    if cat_id_str == UNWATCHED_SERIES_CAT_ID:
+        total = 0
+        for s in get_cached_sections():
+            if s['type'] == 'show':
+                total += len(media_client.get_unwatched_shows(s['id']))
+        return total
+
+    # ── Smart categories ─────────────────────────────────────────────────
+    fn       = get_smart_categories_for_movies if media_type == 'movies' else get_smart_categories_for_series
+    fmt_fn   = get_movies_for_category         if media_type == 'movies' else get_series_for_category
+
+    all_cats = fn()
+    cat      = next((c for c in all_cats if str(c['id']) == cat_id_str), None)
+    if cat:
+        try:
+            items = fmt_fn(cat)
+            return len(items)
+        except Exception:
+            return None
+
+    return None
 
 def connect_server():
     """Connect to the configured media server (Plex, Emby, or Jellyfin)."""
@@ -2396,14 +2441,14 @@ DASHBOARD_HTML = """
     <div class="container">
         <div class="header">
             <h1>🎬 Plex Xtream Bridge</h1>
-            <p>Connect your Plex, Emby, or Jellyfin library to any Xtream UI player</p>
+            <p>Connect your Plex library to any Xtream UI player</p>
         </div>
         
         <div class="status-card">
             <h2 style="margin-bottom: 20px;">System Status</h2>
             <div class="status-grid">
                 <div class="status-item">
-                    <h3>Media Server</h3>
+                    <h3>Plex Server</h3>
                     <p>
                         {% if plex_connected %}
                         <span class="status-badge status-connected">✓ Connected</span>
@@ -2443,8 +2488,8 @@ DASHBOARD_HTML = """
             
             <div style="display: grid; gap: 15px;">
                 <div style="background: #f8f9fa; padding: 20px; border-radius: 10px; border-left: 4px solid #667eea;">
-                    <h3 style="margin-bottom: 10px; color: #333; font-size: 16px;">1️⃣ Configure Media Server Connection</h3>
-                    <p style="color: #666; margin-bottom: 10px;">Go to Settings and enter your media server URL and token.</p>
+                    <h3 style="margin-bottom: 10px; color: #333; font-size: 16px;">1️⃣ Configure Plex Connection</h3>
+                    <p style="color: #666; margin-bottom: 10px;">Go to Settings and enter your Plex server URL and token.</p>
                     {% if not plex_connected %}
                     <a href="/admin/settings" class="button" style="display: inline-block; font-size: 14px; padding: 8px 16px;">Configure Now</a>
                     {% else %}
@@ -3213,7 +3258,13 @@ CATEGORIES_FILTER_HTML = """
     <div class="card">
         <h1>📋 Category Filters</h1>
         <p class="subtitle">Choose which categories are relayed to your IPTV player. All categories are opt-in.</p>
-        <a href="/admin" class="btn btn-secondary" style="font-size:13px;padding:8px 16px;">← Dashboard</a>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <a href="/admin" class="btn btn-secondary" style="font-size:13px;padding:8px 16px;">← Dashboard</a>
+            <button id="load-counts-btn" class="btn btn-secondary" onclick="loadAllCounts()"
+                    style="font-size:13px;padding:8px 16px;">
+                🔢 Load Counts
+            </button>
+        </div>
     </div>
 
     <div id="alert-area"></div>
@@ -3279,12 +3330,15 @@ function catRow(cat, mediaType, bucket, badgeType) {
     const badge = badgeType === 'special'
         ? '<span class="badge-special">special</span>'
         : '<span class="badge-smart">smart</span>';
+    const countBadge = cat.count !== undefined
+        ? `<span class="item-count" style="font-size:11px;color:#999;margin-left:6px;">(${cat.count})</span>`
+        : `<span class="item-count" id="cnt-${mediaType}-${cat.id}" style="font-size:11px;color:#bbb;margin-left:6px;"></span>`;
     return `
     <div class="cat-item">
         <label>
             <input type="checkbox" ${chk}
                 onchange="toggle('${mediaType}','${bucket}','${cat.id}',this.checked)">
-            ${cat.name}
+            ${cat.name}${countBadge}
         </label>
         ${badge}
     </div>`;
@@ -3305,7 +3359,7 @@ function updateCount(mediaType) {
 
 function selectAll(mediaType, bucket) {
     state[mediaType][bucket].forEach(c => c.enabled = true);
-    render(); 
+    render();
 }
 
 function selectNone(mediaType, bucket) {
@@ -3317,6 +3371,55 @@ function render() {
     document.getElementById('cat-grid').innerHTML =
         buildSection('movies', 'Movies', '🎬') +
         buildSection('series', 'Series', '📺');
+}
+
+// ── Count loading ────────────────────────────────────────────────────────────
+let _countLoadStarted = false;
+
+function loadAllCounts() {
+    if (_countLoadStarted) return;
+    _countLoadStarted = true;
+    document.getElementById('load-counts-btn').textContent = '⏳ Loading counts…';
+    document.getElementById('load-counts-btn').disabled = true;
+
+    const tasks = [];
+    for (const mediaType of ['movies', 'series']) {
+        for (const bucket of ['special', 'smart']) {
+            for (const cat of state[mediaType][bucket]) {
+                tasks.push({ id: cat.id, mediaType, bucket });
+            }
+        }
+    }
+
+    // Fetch counts in small concurrent batches so the UI stays responsive
+    const BATCH = 4;
+    let idx = 0;
+
+    function runNext() {
+        if (idx >= tasks.length) {
+            document.getElementById('load-counts-btn').textContent = '✓ Counts loaded';
+            return;
+        }
+        const batch = tasks.slice(idx, idx + BATCH);
+        idx += BATCH;
+        Promise.all(batch.map(t =>
+            fetch(`/admin/categories/count?id=${encodeURIComponent(t.id)}&media_type=${t.mediaType}`)
+                .then(r => r.json())
+                .then(d => {
+                    if (d.count !== null && d.count !== undefined) {
+                        // Update the in-memory state so re-renders preserve counts
+                        const cat = state[t.mediaType][t.bucket].find(c => c.id === t.id);
+                        if (cat) cat.count = d.count;
+                        // Update the span directly without re-rendering the whole list
+                        const el = document.getElementById('cnt-' + t.mediaType + '-' + t.id);
+                        if (el) el.textContent = '(' + d.count + ')';
+                    }
+                })
+                .catch(() => {})
+        )).then(runNext);
+    }
+
+    runNext();
 }
 
 function showAlert(msg, type) {
@@ -5410,16 +5513,16 @@ def view_category_contents(category_type, category_id):
     if not category:
         category = next((c for c in custom_cats if c['id'] == cat_id_str), None)
     
-    # Check Plex library categories
     if not category and plex:
         try:
             section = next((s for s in get_cached_sections() if str(s["id"]) == str(category_id)), None)
-            category = {
-                'id': category_id,
-                'name': f"📁 {section["title"]}",
-                'type': 'plex_library',
-                'section_id': category_id
-            }
+            if section:
+                category = {
+                    'id':         category_id,
+                    'name':       '📁 ' + section['title'],
+                    'type':       'plex_library',
+                    'section_id': category_id
+                }
         except:
             pass
     
@@ -5637,6 +5740,21 @@ def admin_categories():
 def categories_data():
     """JSON endpoint — returns full category list with enabled state."""
     return jsonify(get_full_category_state())
+
+
+@app.route('/admin/categories/count')
+@require_admin_login
+def categories_count():
+    """Return item count for a single category — called per-category by the UI."""
+    cat_id     = request.args.get('id', '')
+    media_type = request.args.get('media_type', 'movies')
+    if not cat_id:
+        return jsonify({'count': None}), 400
+    try:
+        count = get_category_count(cat_id, media_type)
+        return jsonify({'id': cat_id, 'count': count})
+    except Exception as e:
+        return jsonify({'id': cat_id, 'count': None, 'error': str(e)})
 
 
 @app.route('/admin/categories/save', methods=['POST'])
