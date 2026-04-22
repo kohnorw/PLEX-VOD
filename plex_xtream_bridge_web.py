@@ -352,6 +352,24 @@ class PlexClient:
             return None
         return self.get_item(show_id)
 
+    def get_users(self):
+        """
+        Return a list of {'id', 'name'} for all accounts on this Plex server.
+
+        Uses the local /accounts endpoint which lists all managed and home
+        users without requiring a plex.tv round-trip.  The 'id' returned is
+        the Plex account ID (integer) — informational for now since Plex auth
+        is token-based, but shown in the UI for consistency with Emby/Jellyfin.
+        """
+        try:
+            data  = self._get('/accounts')
+            users = data.get('MediaContainer', {}).get('Account', [])
+            return [{'id': str(u.get('id', '')), 'name': u.get('name', '')}
+                    for u in users if u.get('name')]
+        except Exception as e:
+            print(f"[PLEX] Error fetching accounts: {e}")
+            return []
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EmbyJellyfinClient — raw HTTP interface for Emby and Jellyfin
@@ -650,11 +668,26 @@ class EmbyJellyfinClient:
             return []
 
     def get_on_deck(self, limit=50):
+        """
+        Return in-progress items across all libraries.
+
+        The /Resume endpoint without a ParentId defaults to the root level
+        of the user's media tree, missing items stored in sub-folders (i.e.
+        actual Movies/TV libraries).  Passing Recursive=true and
+        IncludeItemTypes=Movie,Episode tells the server to search all
+        descendants, which covers every library the user has access to.
+        """
         try:
-            r     = self._get(f'/Users/{self.user_id}/Items/Resume',
-                              {'Limit': limit * 2,
-                               'Fields': 'Genres,Overview,BackdropImageTags,UserData'})
-            items = r.get('Items', [])
+            r = self._get(
+                f'/Users/{self.user_id}/Items/Resume',
+                {
+                    'Limit':            limit * 2,
+                    'Recursive':        'true',
+                    'IncludeItemTypes': 'Movie,Episode',
+                    'Fields':           'Genres,Overview,BackdropImageTags,UserData',
+                }
+            )
+            items  = r.get('Items', [])
             result = []
             for d in items:
                 t = d.get('Type', '')
@@ -2441,14 +2474,14 @@ DASHBOARD_HTML = """
     <div class="container">
         <div class="header">
             <h1>🎬 Plex Xtream Bridge</h1>
-            <p>Connect your Plex, Emby, or Jellyfin library to any Xtream UI player</p>
+            <p>Connect your Plex library to any Xtream UI player</p>
         </div>
         
         <div class="status-card">
             <h2 style="margin-bottom: 20px;">System Status</h2>
             <div class="status-grid">
                 <div class="status-item">
-                    <h3>Media Server</h3>
+                    <h3>Plex Server</h3>
                     <p>
                         {% if plex_connected %}
                         <span class="status-badge status-connected">✓ Connected</span>
@@ -2488,8 +2521,8 @@ DASHBOARD_HTML = """
             
             <div style="display: grid; gap: 15px;">
                 <div style="background: #f8f9fa; padding: 20px; border-radius: 10px; border-left: 4px solid #667eea;">
-                    <h3 style="margin-bottom: 10px; color: #333; font-size: 16px;">1️⃣ Configure Plex, Emby, or Jellyfin Connection</h3>
-                    <p style="color: #666; margin-bottom: 10px;">Go to Settings and enter your Plex, Emby, or Jellyfin server URL and token.</p>
+                    <h3 style="margin-bottom: 10px; color: #333; font-size: 16px;">1️⃣ Configure Plex Connection</h3>
+                    <p style="color: #666; margin-bottom: 10px;">Go to Settings and enter your Plex server URL and token.</p>
                     {% if not plex_connected %}
                     <a href="/admin/settings" class="button" style="display: inline-block; font-size: 14px; padding: 8px 16px;">Configure Now</a>
                     {% else %}
@@ -2754,8 +2787,17 @@ SETTINGS_HTML = """
                     </div>
                     <div class="form-group">
                         <label for="plex_token">Plex Token</label>
-                        <input type="text" id="plex_token" name="plex_token" value="{{ plex_token }}" placeholder="Your Plex authentication token">
-                        <small>Plex Web → Play media → Get Info → View XML → Copy X-Plex-Token</small>
+                        <div style="display:flex;gap:8px;align-items:flex-start;">
+                            <div style="flex:1;">
+                                <input type="text" id="plex_token" name="plex_token" value="{{ plex_token }}" placeholder="Your Plex authentication token">
+                                <small>Plex Web → Play media → Get Info → View XML → Copy X-Plex-Token</small>
+                            </div>
+                            <button type="button" onclick="discoverPlexUsers()"
+                                    style="padding:12px 16px;background:#28a745;color:white;border:none;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px;">
+                                🔍 Discover
+                            </button>
+                        </div>
+                        <div id="plex-user-list" style="margin-top:8px;display:none;border:1px solid #e1e4e8;border-radius:8px;overflow:hidden;"></div>
                     </div>
                 </div>
 
@@ -2883,6 +2925,44 @@ function discoverUsers() {
                 ).join('');
             } else {
                 list.innerHTML = `<div style="padding:10px;color:#dc3545;">${d.error || 'No users found'}</div>`;
+            }
+        })
+        .catch(e => {
+            list.innerHTML = `<div style="padding:10px;color:#dc3545;">Error: ${e}</div>`;
+        });
+}
+
+function discoverPlexUsers() {
+    const url   = document.getElementById('plex_url').value.trim();
+    const token = document.getElementById('plex_token').value.trim();
+    const list  = document.getElementById('plex-user-list');
+
+    if (!url || !token) {
+        alert('Enter the Plex server URL and token first.');
+        return;
+    }
+
+    list.style.display = 'block';
+    list.innerHTML     = '<div style="padding:10px;color:#666;">Connecting to Plex…</div>';
+
+    fetch(`/admin/discover-plex-users?url=${encodeURIComponent(url)}&token=${encodeURIComponent(token)}`)
+        .then(r => r.json())
+        .then(d => {
+            if (d.success && d.users.length > 0) {
+                list.innerHTML =
+                    `<div style="padding:8px 14px;background:#f8f9fa;font-size:12px;color:#666;border-bottom:1px solid #e9ecef;">
+                        Connected to <strong>${d.server_name}</strong> — ${d.users.length} account(s) found
+                    </div>` +
+                    d.users.map(u =>
+                        `<div style="padding:10px 14px;border-bottom:1px solid #f0f0f0;font-size:14px;display:flex;justify-content:space-between;align-items:center;">
+                            <div>
+                                <strong>${u.name}</strong>
+                                <span style="color:#999;font-size:12px;margin-left:8px;">ID: ${u.id}</span>
+                            </div>
+                        </div>`
+                    ).join('');
+            } else {
+                list.innerHTML = `<div style="padding:10px;color:#dc3545;">${d.error || 'No accounts found'}</div>`;
             }
         })
         .catch(e => {
@@ -4611,6 +4691,26 @@ def discover_users():
         client = EmbyJellyfinClient(url, api_key, '', flavour)
         users  = client.get_users()
         return jsonify({'success': True, 'users': users})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/discover-plex-users')
+@require_admin_login
+def discover_plex_users():
+    """Return account list from a Plex server for the setup UI."""
+    url   = request.args.get('url', '').strip()
+    token = request.args.get('token', '').strip()
+
+    if not url or not token:
+        return jsonify({'success': False, 'error': 'URL and token required'}), 400
+
+    try:
+        client = PlexClient(url, token)
+        if not client.connect():
+            return jsonify({'success': False, 'error': 'Could not connect — check URL and token'}), 400
+        users = client.get_users()
+        return jsonify({'success': True, 'users': users, 'server_name': client.server_name})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
