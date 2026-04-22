@@ -2441,14 +2441,14 @@ DASHBOARD_HTML = """
     <div class="container">
         <div class="header">
             <h1>🎬 Plex Xtream Bridge</h1>
-            <p>Connect your Plex library to any Xtream UI player</p>
+            <p>Connect your Plex, Emby, or Jellyfin library to any Xtream UI player</p>
         </div>
         
         <div class="status-card">
             <h2 style="margin-bottom: 20px;">System Status</h2>
             <div class="status-grid">
                 <div class="status-item">
-                    <h3>Plex Server</h3>
+                    <h3>Media Server</h3>
                     <p>
                         {% if plex_connected %}
                         <span class="status-badge status-connected">✓ Connected</span>
@@ -2488,8 +2488,8 @@ DASHBOARD_HTML = """
             
             <div style="display: grid; gap: 15px;">
                 <div style="background: #f8f9fa; padding: 20px; border-radius: 10px; border-left: 4px solid #667eea;">
-                    <h3 style="margin-bottom: 10px; color: #333; font-size: 16px;">1️⃣ Configure Plex Connection</h3>
-                    <p style="color: #666; margin-bottom: 10px;">Go to Settings and enter your Plex server URL and token.</p>
+                    <h3 style="margin-bottom: 10px; color: #333; font-size: 16px;">1️⃣ Configure Plex, Emby, or Jellyfin Connection</h3>
+                    <p style="color: #666; margin-bottom: 10px;">Go to Settings and enter your Plex, Emby, or Jellyfin server URL and token.</p>
                     {% if not plex_connected %}
                     <a href="/admin/settings" class="button" style="display: inline-block; font-size: 14px; padding: 8px 16px;">Configure Now</a>
                     {% else %}
