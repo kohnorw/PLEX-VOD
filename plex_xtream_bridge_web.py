@@ -354,18 +354,20 @@ class PlexClient:
 
     def get_users(self):
         """
-        Return a list of {'id', 'name'} for all accounts on this Plex server.
+        Return managed/home users from this Plex server, excluding the admin.
 
-        Uses the local /accounts endpoint which lists all managed and home
-        users without requiring a plex.tv round-trip.  The 'id' returned is
-        the Plex account ID (integer) — informational for now since Plex auth
-        is token-based, but shown in the UI for consistency with Emby/Jellyfin.
+        /accounts returns all accounts including the server owner (id=1).
+        We filter to id > 1 which are managed/home users only — the same
+        population that would appear in Plex Home settings.
         """
         try:
             data  = self._get('/accounts')
             users = data.get('MediaContainer', {}).get('Account', [])
-            return [{'id': str(u.get('id', '')), 'name': u.get('name', '')}
-                    for u in users if u.get('name')]
+            return [
+                {'id': str(u.get('id', '')), 'name': u.get('name', '')}
+                for u in users
+                if u.get('name') and int(u.get('id', 0)) != 1
+            ]
         except Exception as e:
             print(f"[PLEX] Error fetching accounts: {e}")
             return []
@@ -963,9 +965,10 @@ def warm_cache_for_library(section_type='movie', limit=None):
         print(f"[CACHE] Error warming cache: {e}")
 
 # Configuration - Update these with your settings
-PLEX_URL    = os.getenv('PLEX_URL', '')
-PLEX_TOKEN  = os.getenv('PLEX_TOKEN', '')
-SERVER_TYPE = os.getenv('SERVER_TYPE', 'plex')   # 'plex', 'emby', 'jellyfin'
+PLEX_URL     = os.getenv('PLEX_URL', '')
+PLEX_TOKEN   = os.getenv('PLEX_TOKEN', '')
+PLEX_USER_ID = os.getenv('PLEX_USER_ID', '')
+SERVER_TYPE  = os.getenv('SERVER_TYPE', 'plex')   # 'plex', 'emby', 'jellyfin'
 EMBY_URL     = os.getenv('EMBY_URL', '')
 EMBY_API_KEY = os.getenv('EMBY_API_KEY', '')
 EMBY_USER_ID = os.getenv('EMBY_USER_ID', '')
@@ -1407,7 +1410,7 @@ def enhance_series_with_tmdb(item):
 
 def load_config():
     """Load configuration from file."""
-    global PLEX_URL, PLEX_TOKEN, SERVER_TYPE, EMBY_URL, EMBY_API_KEY, EMBY_USER_ID
+    global PLEX_URL, PLEX_TOKEN, PLEX_USER_ID, SERVER_TYPE, EMBY_URL, EMBY_API_KEY, EMBY_USER_ID
     global BRIDGE_USERNAME, BRIDGE_PASSWORD, ADMIN_PASSWORD, SHOW_DUMMY_CHANNEL, TMDB_API_KEY, custom_categories
 
     if os.path.exists(CONFIG_FILE):
@@ -1417,9 +1420,10 @@ def load_config():
 
             SERVER_TYPE = config.get('server_type', SERVER_TYPE)
 
-            PLEX_URL   = config.get('plex_url', PLEX_URL)
-            enc_token  = config.get('plex_token', PLEX_TOKEN)
-            PLEX_TOKEN = decrypt_value(enc_token) if enc_token else PLEX_TOKEN
+            PLEX_URL     = config.get('plex_url', PLEX_URL)
+            enc_token    = config.get('plex_token', PLEX_TOKEN)
+            PLEX_TOKEN   = decrypt_value(enc_token) if enc_token else PLEX_TOKEN
+            PLEX_USER_ID = config.get('plex_user_id', PLEX_USER_ID)
 
             EMBY_URL     = config.get('emby_url', EMBY_URL)
             enc_emby_key = config.get('emby_api_key', EMBY_API_KEY)
@@ -1452,6 +1456,7 @@ def save_config():
         'server_type':      SERVER_TYPE,
         'plex_url':         PLEX_URL,
         'plex_token':       encrypt_value(PLEX_TOKEN),
+        'plex_user_id':     PLEX_USER_ID,
         'emby_url':         EMBY_URL,
         'emby_api_key':     encrypt_value(EMBY_API_KEY),
         'emby_user_id':     EMBY_USER_ID,
@@ -2787,10 +2792,15 @@ SETTINGS_HTML = """
                     </div>
                     <div class="form-group">
                         <label for="plex_token">Plex Token</label>
+                        <input type="text" id="plex_token" name="plex_token" value="{{ plex_token }}" placeholder="Your Plex authentication token">
+                        <small>Plex Web → Play media → Get Info → View XML → Copy X-Plex-Token</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="plex_user_id">Home User (Optional)</label>
                         <div style="display:flex;gap:8px;align-items:flex-start;">
                             <div style="flex:1;">
-                                <input type="text" id="plex_token" name="plex_token" value="{{ plex_token }}" placeholder="Your Plex authentication token">
-                                <small>Plex Web → Play media → Get Info → View XML → Copy X-Plex-Token</small>
+                                <input type="text" id="plex_user_id" name="plex_user_id" value="{{ plex_user_id }}" placeholder="Select a home user from Discover">
+                                <small>Select a managed/home user to scope On Deck and watch history</small>
                             </div>
                             <button type="button" onclick="discoverPlexUsers()"
                                     style="padding:12px 16px;background:#28a745;color:white;border:none;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px;">
@@ -2951,23 +2961,35 @@ function discoverPlexUsers() {
             if (d.success && d.users.length > 0) {
                 list.innerHTML =
                     `<div style="padding:8px 14px;background:#f8f9fa;font-size:12px;color:#666;border-bottom:1px solid #e9ecef;">
-                        Connected to <strong>${d.server_name}</strong> — ${d.users.length} account(s) found
+                        Connected to <strong>${d.server_name}</strong> — ${d.users.length} home user(s) found. Click to select.
                     </div>` +
                     d.users.map(u =>
-                        `<div style="padding:10px 14px;border-bottom:1px solid #f0f0f0;font-size:14px;display:flex;justify-content:space-between;align-items:center;">
-                            <div>
-                                <strong>${u.name}</strong>
-                                <span style="color:#999;font-size:12px;margin-left:8px;">ID: ${u.id}</span>
-                            </div>
+                        `<div onclick="selectPlexUser('${u.id}','${u.name}')"
+                              style="padding:10px 14px;cursor:pointer;border-bottom:1px solid #f0f0f0;font-size:14px;"
+                              onmouseover="this.style.background='#f8f9fa'" onmouseout="this.style.background=''">
+                            <strong>${u.name}</strong>
+                            <span style="color:#999;font-size:12px;margin-left:8px;">ID: ${u.id}</span>
                         </div>`
                     ).join('');
+            } else if (d.success && d.users.length === 0) {
+                list.innerHTML = '<div style="padding:10px;color:#666;">No managed home users found. Only the admin account exists.</div>';
             } else {
-                list.innerHTML = `<div style="padding:10px;color:#dc3545;">${d.error || 'No accounts found'}</div>`;
+                list.innerHTML = `<div style="padding:10px;color:#dc3545;">${d.error || 'Could not connect'}</div>`;
             }
         })
         .catch(e => {
             list.innerHTML = `<div style="padding:10px;color:#dc3545;">Error: ${e}</div>`;
         });
+}
+
+function selectPlexUser(id, name) {
+    document.getElementById('plex_user_id').value = name + ' (ID: ' + id + ')';
+    // Store just the ID for the actual form submission via a hidden approach —
+    // overwrite with just the ID so the backend gets a clean value
+    document.getElementById('plex_user_id').value = id;
+    document.getElementById('plex_user_id').setAttribute('data-name', name);
+    document.getElementById('plex_user_id').placeholder = name;
+    document.getElementById('plex-user-list').style.display = 'none';
 }
 
 function selectUser(id, name) {
@@ -4614,7 +4636,7 @@ def admin_dashboard():
 @require_admin_login
 def admin_settings():
     """Settings page — supports Plex, Emby, and Jellyfin."""
-    global PLEX_URL, PLEX_TOKEN, SERVER_TYPE, EMBY_URL, EMBY_API_KEY, EMBY_USER_ID
+    global PLEX_URL, PLEX_TOKEN, PLEX_USER_ID, SERVER_TYPE, EMBY_URL, EMBY_API_KEY, EMBY_USER_ID
     global BRIDGE_USERNAME, BRIDGE_PASSWORD, ADMIN_PASSWORD, SHOW_DUMMY_CHANNEL, TMDB_API_KEY
 
     message = None
@@ -4624,6 +4646,7 @@ def admin_settings():
         new_server_type = request.form.get('server_type', 'plex').strip()
         new_plex_url    = request.form.get('plex_url', '').strip()
         new_plex_token  = request.form.get('plex_token', '').strip()
+        new_plex_uid    = request.form.get('plex_user_id', '').strip()
         new_emby_url    = request.form.get('emby_url', '').strip()
         new_emby_key    = request.form.get('emby_api_key', '').strip()
         new_emby_uid    = request.form.get('emby_user_id', '').strip()
@@ -4641,6 +4664,7 @@ def admin_settings():
             SERVER_TYPE        = new_server_type
             PLEX_URL           = new_plex_url
             PLEX_TOKEN         = new_plex_token
+            PLEX_USER_ID       = new_plex_uid
             EMBY_URL           = new_emby_url
             EMBY_API_KEY       = new_emby_key
             EMBY_USER_ID       = new_emby_uid
@@ -4663,6 +4687,7 @@ def admin_settings():
         server_type=SERVER_TYPE,
         plex_url=PLEX_URL,
         plex_token=PLEX_TOKEN,
+        plex_user_id=PLEX_USER_ID,
         emby_url=EMBY_URL,
         emby_api_key=EMBY_API_KEY,
         emby_user_id=EMBY_USER_ID,
