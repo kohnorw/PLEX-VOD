@@ -1605,11 +1605,12 @@ def get_full_category_state():
     return result
 
 
+
+
 def get_category_count(cat_id, media_type):
     """
     Return the number of items in a given category.
-    Used by the /admin/categories/count endpoint to populate
-    counts in the UI without blocking the initial page load.
+    Used by the /admin/categories/count endpoint.
     """
     if not media_client:
         return None
@@ -1655,10 +1656,10 @@ def connect_server():
     """Connect to the configured media server (Plex, Emby, or Jellyfin)."""
     global plex, media_client
 
-    # Always clear the sections cache so stale IDs from a previous server
-    # don't get used with the new connection
+    # Clear stale caches from any previous connection
     session_cache['sections']      = None
     session_cache['sections_time'] = 0
+    _invalidate_smart_cats_cache()
 
     if SERVER_TYPE == 'plex':
         if not PLEX_URL or not PLEX_TOKEN:
@@ -1701,8 +1702,33 @@ def connect_server():
 # Keep connect_plex as an alias so existing call sites still work
 connect_plex = connect_server
 
+_smart_cats_cache      = {'movies': None, 'series': None}
+_smart_cats_cache_time = {'movies': 0,    'series': 0}
+_SMART_CATS_TTL        = 300   # 5 minutes — matches sections cache TTL
+
+
+def _invalidate_smart_cats_cache():
+    """Call this whenever libraries or settings change."""
+    _smart_cats_cache['movies'] = None
+    _smart_cats_cache['series'] = None
+    _smart_cats_cache_time['movies'] = 0
+    _smart_cats_cache_time['series'] = 0
+
+
 def get_smart_categories_for_movies():
-    """Generate smart categories for movies using PlexClient."""
+    """
+    Generate smart categories for movies using PlexClient.
+
+    Results are cached for 5 minutes so that IDs assigned here remain
+    consistent between get_vod_categories and subsequent get_vod_streams
+    calls — without caching the IDs can shift if genres/decades change
+    between the two requests, causing Dispatcharr to treat them as orphaned.
+    """
+    now = time.time()
+    if (_smart_cats_cache['movies'] is not None and
+            (now - _smart_cats_cache_time['movies']) < _SMART_CATS_TTL):
+        return _smart_cats_cache['movies']
+
     categories = []
     base_id    = 10000
 
@@ -1716,14 +1742,12 @@ def get_smart_categories_for_movies():
             lib_id    = section['id']
             lib_title = section['title']
 
-            # Recently Added
             categories.append({
                 'id': str(base_id), 'name': f"🆕 Recently Added - {lib_title}",
                 'type': 'plex_recently_added', 'section_id': lib_id, 'limit': 50
             })
             base_id += 1
 
-            # Genres
             for genre in media_client.get_genres(lib_id, 'movie'):
                 categories.append({
                     'id': str(base_id), 'name': f"🎭 {genre} - {lib_title}",
@@ -1731,7 +1755,6 @@ def get_smart_categories_for_movies():
                 })
                 base_id += 1
 
-            # Decades
             for decade in media_client.get_decades(lib_id, 'movie'):
                 categories.append({
                     'id': str(base_id), 'name': f"📅 {decade}s - {lib_title}",
@@ -1739,7 +1762,6 @@ def get_smart_categories_for_movies():
                 })
                 base_id += 1
 
-            # Collections
             for col in media_client.get_collections(lib_id):
                 categories.append({
                     'id': str(base_id), 'name': f"📚 {col['title']}",
@@ -1751,10 +1773,21 @@ def get_smart_categories_for_movies():
     except Exception as e:
         print(f"Error generating movie categories: {e}")
 
+    _smart_cats_cache['movies']      = categories
+    _smart_cats_cache_time['movies'] = time.time()
     return categories
 
+
 def get_smart_categories_for_series():
-    """Generate smart categories for TV shows using PlexClient."""
+    """
+    Generate smart categories for TV shows using PlexClient.
+    Cached for 5 minutes for the same reason as get_smart_categories_for_movies.
+    """
+    now = time.time()
+    if (_smart_cats_cache['series'] is not None and
+            (now - _smart_cats_cache_time['series']) < _SMART_CATS_TTL):
+        return _smart_cats_cache['series']
+
     categories = []
     base_id    = 20000
 
@@ -1804,7 +1837,43 @@ def get_smart_categories_for_series():
     except Exception as e:
         print(f"Error generating series categories: {e}")
 
+    _smart_cats_cache['series']      = categories
+    _smart_cats_cache_time['series'] = time.time()
     return categories
+    """Get movies for a specific category using PlexClient."""
+    movies = []
+    if not media_client:
+        return movies
+
+    lib_id = category['section_id']
+    limit  = category.get('limit', 200)
+
+    try:
+        cat_type = category['type']
+        if cat_type == 'plex_recently_added':
+            items = media_client.get_recently_added(lib_id, limit)
+            items = [i for i in items if i['type'] == 'movie']
+        elif cat_type == 'plex_unwatched':
+            items = media_client.get_unwatched_movies(lib_id, limit)
+        elif cat_type == 'plex_genre':
+            items = media_client.get_by_genre(lib_id, category['genre'], 'movie', limit)
+        elif cat_type == 'plex_decade':
+            items = media_client.get_by_decade(lib_id, category['decade'], 'movie', limit)
+        elif cat_type == 'plex_collection':
+            items = media_client.get_collection_items(category['collection_id'], 'movie')[:limit]
+        else:
+            items = []
+
+        for item in items:
+            formatted = format_movie_for_xtream(item, category['id'])
+            if formatted:
+                movies.append(formatted)
+
+    except Exception as e:
+        print(f"Error getting movies for category: {e}")
+
+    return movies
+
 
 def get_movies_for_category(category):
     """Get movies for a specific category using PlexClient."""
@@ -1876,6 +1945,158 @@ def get_series_for_category(category):
         print(f"Error getting series for category: {e}")
 
     return series
+
+
+def _get_all_movies_for_enabled_categories(limit):
+    """
+    Return all movie streams tagged with enabled category IDs.
+    Called by get_vod_streams when no category_id is specified.
+    Placed after get_movies_for_category to avoid forward-reference issues.
+    """
+    movies    = []
+    seen      = set()
+    max_limit = limit if limit > 0 else MAX_MOVIES
+
+    enabled_cats     = []
+    smart_movie_cats = get_smart_categories_for_movies()
+
+    if is_category_enabled(ON_DECK_MOVIE_CAT_ID, 'movies'):
+        enabled_cats.append(('special', ON_DECK_MOVIE_CAT_ID))
+    if is_category_enabled(UNWATCHED_MOVIE_CAT_ID, 'movies'):
+        enabled_cats.append(('special', UNWATCHED_MOVIE_CAT_ID))
+    for c in smart_movie_cats:
+        if is_category_enabled(c['id'], 'movies'):
+            enabled_cats.append(('smart', c['id']))
+
+    if enabled_cats:
+        for cat_type, cat_id in enabled_cats:
+            if len(movies) >= max_limit:
+                break
+            try:
+                if cat_type == 'special':
+                    if cat_id == ON_DECK_MOVIE_CAT_ID:
+                        cat_streams = get_on_deck_movies()
+                    else:
+                        cat_streams = []
+                        for section in get_cached_sections():
+                            if section['type'] == 'movie' and media_client:
+                                for m in media_client.get_unwatched_movies(section['id']):
+                                    fmt = format_movie_for_xtream(m, UNWATCHED_MOVIE_CAT_ID)
+                                    if fmt:
+                                        cat_streams.append(fmt)
+                else:
+                    smart_cat   = next((c for c in smart_movie_cats if c['id'] == cat_id), None)
+                    cat_streams = get_movies_for_category(smart_cat) if smart_cat else []
+
+                for stream in cat_streams:
+                    if not stream:
+                        continue
+                    sid = str(stream.get('stream_id', ''))
+                    if sid and sid not in seen:
+                        seen.add(sid)
+                        stream['category_id'] = str(cat_id)
+                        movies.append(stream)
+                        if len(movies) >= max_limit:
+                            break
+            except Exception as e:
+                print(f"[ERROR] _get_all_movies cat {cat_id}: {e}")
+    else:
+        # No categories configured — show all movies from library (default behaviour)
+        print(f"[DEBUG] _get_all_movies: no categories enabled — returning full library")
+        count = 0
+        for section in get_cached_sections():
+            if section['type'] == 'movie' and media_client:
+                try:
+                    for movie in media_client.get_all_movies(section['id']):
+                        if count >= max_limit:
+                            break
+                        fmt = format_movie_for_xtream(movie, section['id'])
+                        if fmt:
+                            movies.append(fmt)
+                            count += 1
+                except Exception as e:
+                    print(f"[ERROR] _get_all_movies fallback: {e}")
+            if count >= max_limit:
+                break
+
+    return movies
+
+
+def _get_all_series_for_enabled_categories(limit):
+    """
+    Return all series streams tagged with enabled category IDs.
+    Called by get_series when no category_id is specified.
+    """
+    series    = []
+    seen      = set()
+    max_limit = limit if limit > 0 else MAX_SHOWS
+
+    enabled_cats      = []
+    smart_series_cats = get_smart_categories_for_series()
+
+    if is_category_enabled(ON_DECK_SERIES_CAT_ID, 'series'):
+        enabled_cats.append(('special', ON_DECK_SERIES_CAT_ID))
+    if is_category_enabled(UNWATCHED_SERIES_CAT_ID, 'series'):
+        enabled_cats.append(('special', UNWATCHED_SERIES_CAT_ID))
+    for c in smart_series_cats:
+        if is_category_enabled(c['id'], 'series'):
+            enabled_cats.append(('smart', c['id']))
+
+    print(f"[DEBUG] _get_all_series: {len(enabled_cats)} enabled cats")
+
+    if enabled_cats:
+        for cat_type, cat_id in enabled_cats:
+            if len(series) >= max_limit:
+                break
+            try:
+                if cat_type == 'special':
+                    if cat_id == ON_DECK_SERIES_CAT_ID:
+                        cat_streams = get_on_deck_series()
+                    else:
+                        cat_streams = []
+                        for section in get_cached_sections():
+                            if section['type'] == 'show' and media_client:
+                                for s in media_client.get_unwatched_shows(section['id']):
+                                    fmt = format_series_for_xtream(s, UNWATCHED_SERIES_CAT_ID)
+                                    if fmt:
+                                        cat_streams.append(fmt)
+                else:
+                    smart_cat   = next((c for c in smart_series_cats if c['id'] == cat_id), None)
+                    cat_streams = get_series_for_category(smart_cat) if smart_cat else []
+
+                for stream in cat_streams:
+                    if not stream:
+                        continue
+                    sid = str(stream.get('series_id', ''))
+                    if sid and sid not in seen:
+                        seen.add(sid)
+                        stream['category_id'] = str(cat_id)
+                        series.append(stream)
+                        if len(series) >= max_limit:
+                            break
+            except Exception as e:
+                print(f"[ERROR] _get_all_series cat {cat_id}: {e}")
+    else:
+        # No categories configured — show all series from library (default behaviour)
+        print(f"[DEBUG] _get_all_series: no categories enabled — returning full library")
+        count = 0
+        for section in get_cached_sections():
+            if section['type'] == 'show' and media_client:
+                try:
+                    for show in media_client.get_all_shows(section['id']):
+                        if count >= max_limit:
+                            break
+                        fmt = format_series_for_xtream(show, section['id'])
+                        if fmt:
+                            series.append(fmt)
+                            count += 1
+                except Exception as e:
+                    print(f"[ERROR] _get_all_series fallback: {e}")
+            if count >= max_limit:
+                break
+
+    return series
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Continue Watching / On Deck
@@ -4764,15 +4985,14 @@ def player_api():
     """Main Xtream Codes API endpoint"""
     if not media_client:
         return jsonify({"error": "Media server not connected"}), 500
-    
-    action = request.args.get('action')
+
+    action   = request.args.get('action')
     username = request.args.get('username')
-    
-    # Log the request (helpful for debugging)
+
     if action:
         print(f"[API] Request: action={action}, user={username}")
         _record_request(action, username)
-    
+
     if not validate_session():
         return jsonify({
             "user_info": {"auth": 0, "status": "Expired", "message": "Invalid credentials"}
@@ -4840,24 +5060,33 @@ def player_api():
                         "parent_id": 0
                     })
 
-                # ── Regular library sections ────────────────────────────────
-                sections = get_cached_sections()
-                for section in sections:
-                    if section['type'] == 'movie':
-                        categories.append({
-                            "category_id":   str(section['id']),
-                            "category_name": section["title"],
-                            "parent_id": 0
-                        })
-
                 # ── Smart categories (genre, decade, collections) ───────────
-                for cat in get_smart_categories_for_movies():
-                    if is_category_enabled(cat['id'], 'movies'):
-                        categories.append({
-                            "category_id":   cat['id'],
-                            "category_name": cat['name'],
-                            "parent_id": 0
-                        })
+                smart_movie_cats = get_smart_categories_for_movies()
+                enabled_smart    = [c for c in smart_movie_cats if is_category_enabled(c['id'], 'movies')]
+
+                # ── Regular library sections ────────────────────────────────
+                # Shown only when NO categories are enabled — acts as default.
+                # When any category is enabled, suppressed to prevent duplicates.
+                any_movie_enabled = (
+                    is_category_enabled(ON_DECK_MOVIE_CAT_ID, 'movies') or
+                    is_category_enabled(UNWATCHED_MOVIE_CAT_ID, 'movies') or
+                    bool(enabled_smart)
+                )
+                if not any_movie_enabled:
+                    for section in get_cached_sections():
+                        if section['type'] == 'movie':
+                            categories.append({
+                                "category_id":   str(section['id']),
+                                "category_name": section["title"],
+                                "parent_id": 0
+                            })
+
+                for cat in enabled_smart:
+                    categories.append({
+                        "category_id":   cat['id'],
+                        "category_name": cat['name'],
+                        "parent_id": 0
+                    })
 
             except Exception as e:
                 print(f"[ERROR] Failed to get VOD categories: {e}")
@@ -4867,11 +5096,11 @@ def player_api():
     # Get VOD streams (movies)
     elif action == 'get_vod_streams':
         category_id = request.args.get('category_id')
-        limit = int(request.args.get('limit', 0))  # 0 = no limit (backward compatible)
-        
+        limit = int(request.args.get('limit', 0))
+
         print(f"[PERF] get_vod_streams: category={category_id}, limit={limit}")
         start_time = time.time()
-        
+
         movies = []
 
         # ── Continue Watching (movies) ─────────────────────────────────────
@@ -4897,24 +5126,9 @@ def player_api():
             print(f"[PERF] Returned {len(movies)} unwatched movies in {elapsed:.2f}s")
             return jsonify(movies)
 
-        # Handle "All Movies" category (category_id = "0")
+        # Handle "All Movies" / no category — delegates to safe helper
         if category_id == "0" or not category_id:
-            max_limit = limit if limit > 0 else MAX_MOVIES
-            count     = 0
-            for section in get_cached_sections():
-                if section['type'] == 'movie' and media_client:
-                    try:
-                        for movie in media_client.get_all_movies(section['id']):
-                            if count >= max_limit:
-                                break
-                            formatted = format_movie_for_xtream(movie, section['id'])
-                            if formatted:
-                                movies.append(formatted)
-                                count += 1
-                    except Exception as e:
-                        print(f"[ERROR] Error iterating movies: {e}")
-                if count >= max_limit:
-                    break
+            movies = _get_all_movies_for_enabled_categories(limit)
         elif category_id:
             cat_id_str = str(category_id)
             
@@ -4948,7 +5162,7 @@ def player_api():
                                     movies.append(formatted)
                     except Exception as e:
                         print(f"[ERROR] Error getting movies: {e}")
-        
+
         elapsed = time.time() - start_time
         print(f"[PERF] Returned {len(movies)} movies in {elapsed:.2f}s")
         return jsonify(movies)
@@ -5041,24 +5255,33 @@ def player_api():
                         "parent_id": 0
                     })
 
-                # ── Regular library sections ────────────────────────────────
-                sections = get_cached_sections()
-                for section in sections:
-                    if section['type'] == 'show':
-                        categories.append({
-                            "category_id":   str(section['id']),
-                            "category_name": section["title"],
-                            "parent_id": 0
-                        })
-
                 # ── Smart categories ────────────────────────────────────────
-                for cat in get_smart_categories_for_series():
-                    if is_category_enabled(cat['id'], 'series'):
-                        categories.append({
-                            "category_id":   cat['id'],
-                            "category_name": cat['name'],
-                            "parent_id": 0
-                        })
+                smart_series_cats = get_smart_categories_for_series()
+                enabled_smart     = [c for c in smart_series_cats if is_category_enabled(c['id'], 'series')]
+
+                # ── Regular library sections ────────────────────────────────
+                # Shown only when NO categories are enabled — acts as default.
+                # When any category is enabled, suppressed to prevent duplicates.
+                any_series_enabled = (
+                    is_category_enabled(ON_DECK_SERIES_CAT_ID, 'series') or
+                    is_category_enabled(UNWATCHED_SERIES_CAT_ID, 'series') or
+                    bool(enabled_smart)
+                )
+                if not any_series_enabled:
+                    for section in get_cached_sections():
+                        if section['type'] == 'show':
+                            categories.append({
+                                "category_id":   str(section['id']),
+                                "category_name": section["title"],
+                                "parent_id": 0
+                            })
+
+                for cat in enabled_smart:
+                    categories.append({
+                        "category_id":   cat['id'],
+                        "category_name": cat['name'],
+                        "parent_id": 0
+                    })
 
             except Exception as e:
                 print(f"[ERROR] Failed to get series categories: {e}")
@@ -5098,26 +5321,9 @@ def player_api():
             print(f"[PERF] Returned {len(series_list)} unwatched shows in {elapsed:.2f}s")
             return jsonify(series_list)
 
-        # Handle "All Series" category (category_id = "0")
+        # Handle "All Series" / no category — delegates to safe helper
         if category_id == "0" or not category_id:
-            max_limit = limit if limit > 0 else MAX_SHOWS
-            print(f"[DEBUG] Returning all series from all sections (max {max_limit})")
-            count = 0
-            for section in get_cached_sections():
-                if section['type'] == 'show' and media_client:
-                    print(f"[DEBUG] Processing TV section: {section['title']}")
-                    try:
-                        for show in media_client.get_all_shows(section['id']):
-                            if count >= max_limit:
-                                break
-                            formatted = format_series_for_xtream(show, section['id'])
-                            if formatted:
-                                series_list.append(formatted)
-                                count += 1
-                    except Exception as e:
-                        print(f"[ERROR] Error iterating shows: {e}")
-                if count >= max_limit:
-                    break
+            series_list = _get_all_series_for_enabled_categories(limit)
         elif category_id:
             cat_id_str = str(category_id)
             
