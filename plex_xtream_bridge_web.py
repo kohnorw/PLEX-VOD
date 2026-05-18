@@ -352,6 +352,26 @@ class PlexClient:
             return None
         return self.get_item(show_id)
 
+    def get_users(self):
+        """
+        Return managed/home users from this Plex server, excluding the admin.
+
+        /accounts returns all accounts including the server owner (id=1).
+        We filter to id > 1 which are managed/home users only — the same
+        population that would appear in Plex Home settings.
+        """
+        try:
+            data  = self._get('/accounts')
+            users = data.get('MediaContainer', {}).get('Account', [])
+            return [
+                {'id': str(u.get('id', '')), 'name': u.get('name', '')}
+                for u in users
+                if u.get('name') and int(u.get('id', 0)) != 1
+            ]
+        except Exception as e:
+            print(f"[PLEX] Error fetching accounts: {e}")
+            return []
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EmbyJellyfinClient — raw HTTP interface for Emby and Jellyfin
@@ -650,11 +670,26 @@ class EmbyJellyfinClient:
             return []
 
     def get_on_deck(self, limit=50):
+        """
+        Return in-progress items across all libraries.
+
+        The /Resume endpoint without a ParentId defaults to the root level
+        of the user's media tree, missing items stored in sub-folders (i.e.
+        actual Movies/TV libraries).  Passing Recursive=true and
+        IncludeItemTypes=Movie,Episode tells the server to search all
+        descendants, which covers every library the user has access to.
+        """
         try:
-            r     = self._get(f'/Users/{self.user_id}/Items/Resume',
-                              {'Limit': limit * 2,
-                               'Fields': 'Genres,Overview,BackdropImageTags,UserData'})
-            items = r.get('Items', [])
+            r = self._get(
+                f'/Users/{self.user_id}/Items/Resume',
+                {
+                    'Limit':            limit * 2,
+                    'Recursive':        'true',
+                    'IncludeItemTypes': 'Movie,Episode',
+                    'Fields':           'Genres,Overview,BackdropImageTags,UserData',
+                }
+            )
+            items  = r.get('Items', [])
             result = []
             for d in items:
                 t = d.get('Type', '')
@@ -930,9 +965,10 @@ def warm_cache_for_library(section_type='movie', limit=None):
         print(f"[CACHE] Error warming cache: {e}")
 
 # Configuration - Update these with your settings
-PLEX_URL    = os.getenv('PLEX_URL', '')
-PLEX_TOKEN  = os.getenv('PLEX_TOKEN', '')
-SERVER_TYPE = os.getenv('SERVER_TYPE', 'plex')   # 'plex', 'emby', 'jellyfin'
+PLEX_URL     = os.getenv('PLEX_URL', '')
+PLEX_TOKEN   = os.getenv('PLEX_TOKEN', '')
+PLEX_USER_ID = os.getenv('PLEX_USER_ID', '')
+SERVER_TYPE  = os.getenv('SERVER_TYPE', 'plex')   # 'plex', 'emby', 'jellyfin'
 EMBY_URL     = os.getenv('EMBY_URL', '')
 EMBY_API_KEY = os.getenv('EMBY_API_KEY', '')
 EMBY_USER_ID = os.getenv('EMBY_USER_ID', '')
@@ -1374,7 +1410,7 @@ def enhance_series_with_tmdb(item):
 
 def load_config():
     """Load configuration from file."""
-    global PLEX_URL, PLEX_TOKEN, SERVER_TYPE, EMBY_URL, EMBY_API_KEY, EMBY_USER_ID
+    global PLEX_URL, PLEX_TOKEN, PLEX_USER_ID, SERVER_TYPE, EMBY_URL, EMBY_API_KEY, EMBY_USER_ID
     global BRIDGE_USERNAME, BRIDGE_PASSWORD, ADMIN_PASSWORD, SHOW_DUMMY_CHANNEL, TMDB_API_KEY, custom_categories
 
     if os.path.exists(CONFIG_FILE):
@@ -1384,9 +1420,10 @@ def load_config():
 
             SERVER_TYPE = config.get('server_type', SERVER_TYPE)
 
-            PLEX_URL   = config.get('plex_url', PLEX_URL)
-            enc_token  = config.get('plex_token', PLEX_TOKEN)
-            PLEX_TOKEN = decrypt_value(enc_token) if enc_token else PLEX_TOKEN
+            PLEX_URL     = config.get('plex_url', PLEX_URL)
+            enc_token    = config.get('plex_token', PLEX_TOKEN)
+            PLEX_TOKEN   = decrypt_value(enc_token) if enc_token else PLEX_TOKEN
+            PLEX_USER_ID = config.get('plex_user_id', PLEX_USER_ID)
 
             EMBY_URL     = config.get('emby_url', EMBY_URL)
             enc_emby_key = config.get('emby_api_key', EMBY_API_KEY)
@@ -1419,6 +1456,7 @@ def save_config():
         'server_type':      SERVER_TYPE,
         'plex_url':         PLEX_URL,
         'plex_token':       encrypt_value(PLEX_TOKEN),
+        'plex_user_id':     PLEX_USER_ID,
         'emby_url':         EMBY_URL,
         'emby_api_key':     encrypt_value(EMBY_API_KEY),
         'emby_user_id':     EMBY_USER_ID,
@@ -1547,7 +1585,6 @@ def get_full_category_state():
 
     for media_type, fn in (('movies', get_smart_categories_for_movies),
                            ('series', get_smart_categories_for_series)):
-        # Special categories
         for cat in SPECIAL_CATEGORY_DEFS[media_type]:
             result[media_type]['special'].append({
                 'id':      cat['id'],
@@ -1555,7 +1592,6 @@ def get_full_category_state():
                 'enabled': is_category_enabled(cat['id'], media_type),
             })
 
-        # Smart categories (genres, decades, collections, recently added)
         try:
             for cat in fn():
                 result[media_type]['smart'].append({
@@ -1568,14 +1604,62 @@ def get_full_category_state():
 
     return result
 
+
+
+
+def get_category_count(cat_id, media_type):
+    """
+    Return the number of items in a given category.
+    Used by the /admin/categories/count endpoint.
+    """
+    if not media_client:
+        return None
+
+    cat_id_str = str(cat_id)
+
+    # ── Special categories ───────────────────────────────────────────────
+    if cat_id_str == ON_DECK_MOVIE_CAT_ID:
+        return len(get_on_deck_movies())
+    if cat_id_str == ON_DECK_SERIES_CAT_ID:
+        return len(get_on_deck_series())
+    if cat_id_str == UNWATCHED_MOVIE_CAT_ID:
+        total = 0
+        for s in get_cached_sections():
+            if s['type'] == 'movie':
+                total += media_client.total_view_size(s['id'], 'unwatched_movie') \
+                         if hasattr(media_client, 'total_unwatched_size') \
+                         else len(media_client.get_unwatched_movies(s['id']))
+        return total
+    if cat_id_str == UNWATCHED_SERIES_CAT_ID:
+        total = 0
+        for s in get_cached_sections():
+            if s['type'] == 'show':
+                total += len(media_client.get_unwatched_shows(s['id']))
+        return total
+
+    # ── Smart categories ─────────────────────────────────────────────────
+    fn       = get_smart_categories_for_movies if media_type == 'movies' else get_smart_categories_for_series
+    fmt_fn   = get_movies_for_category         if media_type == 'movies' else get_series_for_category
+
+    all_cats = fn()
+    cat      = next((c for c in all_cats if str(c['id']) == cat_id_str), None)
+    if cat:
+        try:
+            items = fmt_fn(cat)
+            return len(items)
+        except Exception:
+            return None
+
+    return None
+
 def connect_server():
     """Connect to the configured media server (Plex, Emby, or Jellyfin)."""
     global plex, media_client
 
-    # Always clear the sections cache so stale IDs from a previous server
-    # don't get used with the new connection
+    # Clear stale caches from any previous connection
     session_cache['sections']      = None
     session_cache['sections_time'] = 0
+    _invalidate_smart_cats_cache()
 
     if SERVER_TYPE == 'plex':
         if not PLEX_URL or not PLEX_TOKEN:
@@ -1618,8 +1702,33 @@ def connect_server():
 # Keep connect_plex as an alias so existing call sites still work
 connect_plex = connect_server
 
+_smart_cats_cache      = {'movies': None, 'series': None}
+_smart_cats_cache_time = {'movies': 0,    'series': 0}
+_SMART_CATS_TTL        = 300   # 5 minutes — matches sections cache TTL
+
+
+def _invalidate_smart_cats_cache():
+    """Call this whenever libraries or settings change."""
+    _smart_cats_cache['movies'] = None
+    _smart_cats_cache['series'] = None
+    _smart_cats_cache_time['movies'] = 0
+    _smart_cats_cache_time['series'] = 0
+
+
 def get_smart_categories_for_movies():
-    """Generate smart categories for movies using PlexClient."""
+    """
+    Generate smart categories for movies using PlexClient.
+
+    Results are cached for 5 minutes so that IDs assigned here remain
+    consistent between get_vod_categories and subsequent get_vod_streams
+    calls — without caching the IDs can shift if genres/decades change
+    between the two requests, causing Dispatcharr to treat them as orphaned.
+    """
+    now = time.time()
+    if (_smart_cats_cache['movies'] is not None and
+            (now - _smart_cats_cache_time['movies']) < _SMART_CATS_TTL):
+        return _smart_cats_cache['movies']
+
     categories = []
     base_id    = 10000
 
@@ -1633,14 +1742,12 @@ def get_smart_categories_for_movies():
             lib_id    = section['id']
             lib_title = section['title']
 
-            # Recently Added
             categories.append({
                 'id': str(base_id), 'name': f"🆕 Recently Added - {lib_title}",
                 'type': 'plex_recently_added', 'section_id': lib_id, 'limit': 50
             })
             base_id += 1
 
-            # Genres
             for genre in media_client.get_genres(lib_id, 'movie'):
                 categories.append({
                     'id': str(base_id), 'name': f"🎭 {genre} - {lib_title}",
@@ -1648,7 +1755,6 @@ def get_smart_categories_for_movies():
                 })
                 base_id += 1
 
-            # Decades
             for decade in media_client.get_decades(lib_id, 'movie'):
                 categories.append({
                     'id': str(base_id), 'name': f"📅 {decade}s - {lib_title}",
@@ -1656,7 +1762,6 @@ def get_smart_categories_for_movies():
                 })
                 base_id += 1
 
-            # Collections
             for col in media_client.get_collections(lib_id):
                 categories.append({
                     'id': str(base_id), 'name': f"📚 {col['title']}",
@@ -1668,10 +1773,21 @@ def get_smart_categories_for_movies():
     except Exception as e:
         print(f"Error generating movie categories: {e}")
 
+    _smart_cats_cache['movies']      = categories
+    _smart_cats_cache_time['movies'] = time.time()
     return categories
 
+
 def get_smart_categories_for_series():
-    """Generate smart categories for TV shows using PlexClient."""
+    """
+    Generate smart categories for TV shows using PlexClient.
+    Cached for 5 minutes for the same reason as get_smart_categories_for_movies.
+    """
+    now = time.time()
+    if (_smart_cats_cache['series'] is not None and
+            (now - _smart_cats_cache_time['series']) < _SMART_CATS_TTL):
+        return _smart_cats_cache['series']
+
     categories = []
     base_id    = 20000
 
@@ -1721,7 +1837,43 @@ def get_smart_categories_for_series():
     except Exception as e:
         print(f"Error generating series categories: {e}")
 
+    _smart_cats_cache['series']      = categories
+    _smart_cats_cache_time['series'] = time.time()
     return categories
+    """Get movies for a specific category using PlexClient."""
+    movies = []
+    if not media_client:
+        return movies
+
+    lib_id = category['section_id']
+    limit  = category.get('limit', 200)
+
+    try:
+        cat_type = category['type']
+        if cat_type == 'plex_recently_added':
+            items = media_client.get_recently_added(lib_id, limit)
+            items = [i for i in items if i['type'] == 'movie']
+        elif cat_type == 'plex_unwatched':
+            items = media_client.get_unwatched_movies(lib_id, limit)
+        elif cat_type == 'plex_genre':
+            items = media_client.get_by_genre(lib_id, category['genre'], 'movie', limit)
+        elif cat_type == 'plex_decade':
+            items = media_client.get_by_decade(lib_id, category['decade'], 'movie', limit)
+        elif cat_type == 'plex_collection':
+            items = media_client.get_collection_items(category['collection_id'], 'movie')[:limit]
+        else:
+            items = []
+
+        for item in items:
+            formatted = format_movie_for_xtream(item, category['id'])
+            if formatted:
+                movies.append(formatted)
+
+    except Exception as e:
+        print(f"Error getting movies for category: {e}")
+
+    return movies
+
 
 def get_movies_for_category(category):
     """Get movies for a specific category using PlexClient."""
@@ -1793,6 +1945,158 @@ def get_series_for_category(category):
         print(f"Error getting series for category: {e}")
 
     return series
+
+
+def _get_all_movies_for_enabled_categories(limit):
+    """
+    Return all movie streams tagged with enabled category IDs.
+    Called by get_vod_streams when no category_id is specified.
+    Placed after get_movies_for_category to avoid forward-reference issues.
+    """
+    movies    = []
+    seen      = set()
+    max_limit = limit if limit > 0 else MAX_MOVIES
+
+    enabled_cats     = []
+    smart_movie_cats = get_smart_categories_for_movies()
+
+    if is_category_enabled(ON_DECK_MOVIE_CAT_ID, 'movies'):
+        enabled_cats.append(('special', ON_DECK_MOVIE_CAT_ID))
+    if is_category_enabled(UNWATCHED_MOVIE_CAT_ID, 'movies'):
+        enabled_cats.append(('special', UNWATCHED_MOVIE_CAT_ID))
+    for c in smart_movie_cats:
+        if is_category_enabled(c['id'], 'movies'):
+            enabled_cats.append(('smart', c['id']))
+
+    if enabled_cats:
+        for cat_type, cat_id in enabled_cats:
+            if len(movies) >= max_limit:
+                break
+            try:
+                if cat_type == 'special':
+                    if cat_id == ON_DECK_MOVIE_CAT_ID:
+                        cat_streams = get_on_deck_movies()
+                    else:
+                        cat_streams = []
+                        for section in get_cached_sections():
+                            if section['type'] == 'movie' and media_client:
+                                for m in media_client.get_unwatched_movies(section['id']):
+                                    fmt = format_movie_for_xtream(m, UNWATCHED_MOVIE_CAT_ID)
+                                    if fmt:
+                                        cat_streams.append(fmt)
+                else:
+                    smart_cat   = next((c for c in smart_movie_cats if c['id'] == cat_id), None)
+                    cat_streams = get_movies_for_category(smart_cat) if smart_cat else []
+
+                for stream in cat_streams:
+                    if not stream:
+                        continue
+                    sid = str(stream.get('stream_id', ''))
+                    if sid and sid not in seen:
+                        seen.add(sid)
+                        stream['category_id'] = str(cat_id)
+                        movies.append(stream)
+                        if len(movies) >= max_limit:
+                            break
+            except Exception as e:
+                print(f"[ERROR] _get_all_movies cat {cat_id}: {e}")
+    else:
+        # No categories configured — show all movies from library (default behaviour)
+        print(f"[DEBUG] _get_all_movies: no categories enabled — returning full library")
+        count = 0
+        for section in get_cached_sections():
+            if section['type'] == 'movie' and media_client:
+                try:
+                    for movie in media_client.get_all_movies(section['id']):
+                        if count >= max_limit:
+                            break
+                        fmt = format_movie_for_xtream(movie, section['id'])
+                        if fmt:
+                            movies.append(fmt)
+                            count += 1
+                except Exception as e:
+                    print(f"[ERROR] _get_all_movies fallback: {e}")
+            if count >= max_limit:
+                break
+
+    return movies
+
+
+def _get_all_series_for_enabled_categories(limit):
+    """
+    Return all series streams tagged with enabled category IDs.
+    Called by get_series when no category_id is specified.
+    """
+    series    = []
+    seen      = set()
+    max_limit = limit if limit > 0 else MAX_SHOWS
+
+    enabled_cats      = []
+    smart_series_cats = get_smart_categories_for_series()
+
+    if is_category_enabled(ON_DECK_SERIES_CAT_ID, 'series'):
+        enabled_cats.append(('special', ON_DECK_SERIES_CAT_ID))
+    if is_category_enabled(UNWATCHED_SERIES_CAT_ID, 'series'):
+        enabled_cats.append(('special', UNWATCHED_SERIES_CAT_ID))
+    for c in smart_series_cats:
+        if is_category_enabled(c['id'], 'series'):
+            enabled_cats.append(('smart', c['id']))
+
+    print(f"[DEBUG] _get_all_series: {len(enabled_cats)} enabled cats")
+
+    if enabled_cats:
+        for cat_type, cat_id in enabled_cats:
+            if len(series) >= max_limit:
+                break
+            try:
+                if cat_type == 'special':
+                    if cat_id == ON_DECK_SERIES_CAT_ID:
+                        cat_streams = get_on_deck_series()
+                    else:
+                        cat_streams = []
+                        for section in get_cached_sections():
+                            if section['type'] == 'show' and media_client:
+                                for s in media_client.get_unwatched_shows(section['id']):
+                                    fmt = format_series_for_xtream(s, UNWATCHED_SERIES_CAT_ID)
+                                    if fmt:
+                                        cat_streams.append(fmt)
+                else:
+                    smart_cat   = next((c for c in smart_series_cats if c['id'] == cat_id), None)
+                    cat_streams = get_series_for_category(smart_cat) if smart_cat else []
+
+                for stream in cat_streams:
+                    if not stream:
+                        continue
+                    sid = str(stream.get('series_id', ''))
+                    if sid and sid not in seen:
+                        seen.add(sid)
+                        stream['category_id'] = str(cat_id)
+                        series.append(stream)
+                        if len(series) >= max_limit:
+                            break
+            except Exception as e:
+                print(f"[ERROR] _get_all_series cat {cat_id}: {e}")
+    else:
+        # No categories configured — show all series from library (default behaviour)
+        print(f"[DEBUG] _get_all_series: no categories enabled — returning full library")
+        count = 0
+        for section in get_cached_sections():
+            if section['type'] == 'show' and media_client:
+                try:
+                    for show in media_client.get_all_shows(section['id']):
+                        if count >= max_limit:
+                            break
+                        fmt = format_series_for_xtream(show, section['id'])
+                        if fmt:
+                            series.append(fmt)
+                            count += 1
+                except Exception as e:
+                    print(f"[ERROR] _get_all_series fallback: {e}")
+            if count >= max_limit:
+                break
+
+    return series
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Continue Watching / On Deck
@@ -2396,14 +2700,14 @@ DASHBOARD_HTML = """
     <div class="container">
         <div class="header">
             <h1>🎬 Plex Xtream Bridge</h1>
-            <p>Connect your Plex, Emby, or Jellyfin library to any Xtream UI player</p>
+            <p>Connect your Plex library to any Xtream UI player</p>
         </div>
         
         <div class="status-card">
             <h2 style="margin-bottom: 20px;">System Status</h2>
             <div class="status-grid">
                 <div class="status-item">
-                    <h3>Media Server</h3>
+                    <h3>Plex Server</h3>
                     <p>
                         {% if plex_connected %}
                         <span class="status-badge status-connected">✓ Connected</span>
@@ -2443,8 +2747,8 @@ DASHBOARD_HTML = """
             
             <div style="display: grid; gap: 15px;">
                 <div style="background: #f8f9fa; padding: 20px; border-radius: 10px; border-left: 4px solid #667eea;">
-                    <h3 style="margin-bottom: 10px; color: #333; font-size: 16px;">1️⃣ Configure Media Server Connection</h3>
-                    <p style="color: #666; margin-bottom: 10px;">Go to Settings and enter your media server URL and token.</p>
+                    <h3 style="margin-bottom: 10px; color: #333; font-size: 16px;">1️⃣ Configure Plex Connection</h3>
+                    <p style="color: #666; margin-bottom: 10px;">Go to Settings and enter your Plex server URL and token.</p>
                     {% if not plex_connected %}
                     <a href="/admin/settings" class="button" style="display: inline-block; font-size: 14px; padding: 8px 16px;">Configure Now</a>
                     {% else %}
@@ -2712,6 +3016,20 @@ SETTINGS_HTML = """
                         <input type="text" id="plex_token" name="plex_token" value="{{ plex_token }}" placeholder="Your Plex authentication token">
                         <small>Plex Web → Play media → Get Info → View XML → Copy X-Plex-Token</small>
                     </div>
+                    <div class="form-group">
+                        <label for="plex_user_id">Home User (Optional)</label>
+                        <div style="display:flex;gap:8px;align-items:flex-start;">
+                            <div style="flex:1;">
+                                <input type="text" id="plex_user_id" name="plex_user_id" value="{{ plex_user_id }}" placeholder="Select a home user from Discover">
+                                <small>Select a managed/home user to scope On Deck and watch history</small>
+                            </div>
+                            <button type="button" onclick="discoverPlexUsers()"
+                                    style="padding:12px 16px;background:#28a745;color:white;border:none;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px;">
+                                🔍 Discover
+                            </button>
+                        </div>
+                        <div id="plex-user-list" style="margin-top:8px;display:none;border:1px solid #e1e4e8;border-radius:8px;overflow:hidden;"></div>
+                    </div>
                 </div>
 
                 <!-- Emby / Jellyfin fields -->
@@ -2843,6 +3161,56 @@ function discoverUsers() {
         .catch(e => {
             list.innerHTML = `<div style="padding:10px;color:#dc3545;">Error: ${e}</div>`;
         });
+}
+
+function discoverPlexUsers() {
+    const url   = document.getElementById('plex_url').value.trim();
+    const token = document.getElementById('plex_token').value.trim();
+    const list  = document.getElementById('plex-user-list');
+
+    if (!url || !token) {
+        alert('Enter the Plex server URL and token first.');
+        return;
+    }
+
+    list.style.display = 'block';
+    list.innerHTML     = '<div style="padding:10px;color:#666;">Connecting to Plex…</div>';
+
+    fetch(`/admin/discover-plex-users?url=${encodeURIComponent(url)}&token=${encodeURIComponent(token)}`)
+        .then(r => r.json())
+        .then(d => {
+            if (d.success && d.users.length > 0) {
+                list.innerHTML =
+                    `<div style="padding:8px 14px;background:#f8f9fa;font-size:12px;color:#666;border-bottom:1px solid #e9ecef;">
+                        Connected to <strong>${d.server_name}</strong> — ${d.users.length} home user(s) found. Click to select.
+                    </div>` +
+                    d.users.map(u =>
+                        `<div onclick="selectPlexUser('${u.id}','${u.name}')"
+                              style="padding:10px 14px;cursor:pointer;border-bottom:1px solid #f0f0f0;font-size:14px;"
+                              onmouseover="this.style.background='#f8f9fa'" onmouseout="this.style.background=''">
+                            <strong>${u.name}</strong>
+                            <span style="color:#999;font-size:12px;margin-left:8px;">ID: ${u.id}</span>
+                        </div>`
+                    ).join('');
+            } else if (d.success && d.users.length === 0) {
+                list.innerHTML = '<div style="padding:10px;color:#666;">No managed home users found. Only the admin account exists.</div>';
+            } else {
+                list.innerHTML = `<div style="padding:10px;color:#dc3545;">${d.error || 'Could not connect'}</div>`;
+            }
+        })
+        .catch(e => {
+            list.innerHTML = `<div style="padding:10px;color:#dc3545;">Error: ${e}</div>`;
+        });
+}
+
+function selectPlexUser(id, name) {
+    document.getElementById('plex_user_id').value = name + ' (ID: ' + id + ')';
+    // Store just the ID for the actual form submission via a hidden approach —
+    // overwrite with just the ID so the backend gets a clean value
+    document.getElementById('plex_user_id').value = id;
+    document.getElementById('plex_user_id').setAttribute('data-name', name);
+    document.getElementById('plex_user_id').placeholder = name;
+    document.getElementById('plex-user-list').style.display = 'none';
 }
 
 function selectUser(id, name) {
@@ -3213,7 +3581,13 @@ CATEGORIES_FILTER_HTML = """
     <div class="card">
         <h1>📋 Category Filters</h1>
         <p class="subtitle">Choose which categories are relayed to your IPTV player. All categories are opt-in.</p>
-        <a href="/admin" class="btn btn-secondary" style="font-size:13px;padding:8px 16px;">← Dashboard</a>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <a href="/admin" class="btn btn-secondary" style="font-size:13px;padding:8px 16px;">← Dashboard</a>
+            <button id="load-counts-btn" class="btn btn-secondary" onclick="loadAllCounts()"
+                    style="font-size:13px;padding:8px 16px;">
+                🔢 Load Counts
+            </button>
+        </div>
     </div>
 
     <div id="alert-area"></div>
@@ -3279,12 +3653,15 @@ function catRow(cat, mediaType, bucket, badgeType) {
     const badge = badgeType === 'special'
         ? '<span class="badge-special">special</span>'
         : '<span class="badge-smart">smart</span>';
+    const countBadge = cat.count !== undefined
+        ? `<span class="item-count" style="font-size:11px;color:#999;margin-left:6px;">(${cat.count})</span>`
+        : `<span class="item-count" id="cnt-${mediaType}-${cat.id}" style="font-size:11px;color:#bbb;margin-left:6px;"></span>`;
     return `
     <div class="cat-item">
         <label>
             <input type="checkbox" ${chk}
                 onchange="toggle('${mediaType}','${bucket}','${cat.id}',this.checked)">
-            ${cat.name}
+            ${cat.name}${countBadge}
         </label>
         ${badge}
     </div>`;
@@ -3305,7 +3682,7 @@ function updateCount(mediaType) {
 
 function selectAll(mediaType, bucket) {
     state[mediaType][bucket].forEach(c => c.enabled = true);
-    render(); 
+    render();
 }
 
 function selectNone(mediaType, bucket) {
@@ -3317,6 +3694,55 @@ function render() {
     document.getElementById('cat-grid').innerHTML =
         buildSection('movies', 'Movies', '🎬') +
         buildSection('series', 'Series', '📺');
+}
+
+// ── Count loading ────────────────────────────────────────────────────────────
+let _countLoadStarted = false;
+
+function loadAllCounts() {
+    if (_countLoadStarted) return;
+    _countLoadStarted = true;
+    document.getElementById('load-counts-btn').textContent = '⏳ Loading counts…';
+    document.getElementById('load-counts-btn').disabled = true;
+
+    const tasks = [];
+    for (const mediaType of ['movies', 'series']) {
+        for (const bucket of ['special', 'smart']) {
+            for (const cat of state[mediaType][bucket]) {
+                tasks.push({ id: cat.id, mediaType, bucket });
+            }
+        }
+    }
+
+    // Fetch counts in small concurrent batches so the UI stays responsive
+    const BATCH = 4;
+    let idx = 0;
+
+    function runNext() {
+        if (idx >= tasks.length) {
+            document.getElementById('load-counts-btn').textContent = '✓ Counts loaded';
+            return;
+        }
+        const batch = tasks.slice(idx, idx + BATCH);
+        idx += BATCH;
+        Promise.all(batch.map(t =>
+            fetch(`/admin/categories/count?id=${encodeURIComponent(t.id)}&media_type=${t.mediaType}`)
+                .then(r => r.json())
+                .then(d => {
+                    if (d.count !== null && d.count !== undefined) {
+                        // Update the in-memory state so re-renders preserve counts
+                        const cat = state[t.mediaType][t.bucket].find(c => c.id === t.id);
+                        if (cat) cat.count = d.count;
+                        // Update the span directly without re-rendering the whole list
+                        const el = document.getElementById('cnt-' + t.mediaType + '-' + t.id);
+                        if (el) el.textContent = '(' + d.count + ')';
+                    }
+                })
+                .catch(() => {})
+        )).then(runNext);
+    }
+
+    runNext();
 }
 
 function showAlert(msg, type) {
@@ -4431,7 +4857,7 @@ def admin_dashboard():
 @require_admin_login
 def admin_settings():
     """Settings page — supports Plex, Emby, and Jellyfin."""
-    global PLEX_URL, PLEX_TOKEN, SERVER_TYPE, EMBY_URL, EMBY_API_KEY, EMBY_USER_ID
+    global PLEX_URL, PLEX_TOKEN, PLEX_USER_ID, SERVER_TYPE, EMBY_URL, EMBY_API_KEY, EMBY_USER_ID
     global BRIDGE_USERNAME, BRIDGE_PASSWORD, ADMIN_PASSWORD, SHOW_DUMMY_CHANNEL, TMDB_API_KEY
 
     message = None
@@ -4441,6 +4867,7 @@ def admin_settings():
         new_server_type = request.form.get('server_type', 'plex').strip()
         new_plex_url    = request.form.get('plex_url', '').strip()
         new_plex_token  = request.form.get('plex_token', '').strip()
+        new_plex_uid    = request.form.get('plex_user_id', '').strip()
         new_emby_url    = request.form.get('emby_url', '').strip()
         new_emby_key    = request.form.get('emby_api_key', '').strip()
         new_emby_uid    = request.form.get('emby_user_id', '').strip()
@@ -4458,6 +4885,7 @@ def admin_settings():
             SERVER_TYPE        = new_server_type
             PLEX_URL           = new_plex_url
             PLEX_TOKEN         = new_plex_token
+            PLEX_USER_ID       = new_plex_uid
             EMBY_URL           = new_emby_url
             EMBY_API_KEY       = new_emby_key
             EMBY_USER_ID       = new_emby_uid
@@ -4480,6 +4908,7 @@ def admin_settings():
         server_type=SERVER_TYPE,
         plex_url=PLEX_URL,
         plex_token=PLEX_TOKEN,
+        plex_user_id=PLEX_USER_ID,
         emby_url=EMBY_URL,
         emby_api_key=EMBY_API_KEY,
         emby_user_id=EMBY_USER_ID,
@@ -4512,6 +4941,26 @@ def discover_users():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/admin/discover-plex-users')
+@require_admin_login
+def discover_plex_users():
+    """Return account list from a Plex server for the setup UI."""
+    url   = request.args.get('url', '').strip()
+    token = request.args.get('token', '').strip()
+
+    if not url or not token:
+        return jsonify({'success': False, 'error': 'URL and token required'}), 400
+
+    try:
+        client = PlexClient(url, token)
+        if not client.connect():
+            return jsonify({'success': False, 'error': 'Could not connect — check URL and token'}), 400
+        users = client.get_users()
+        return jsonify({'success': True, 'users': users, 'server_name': client.server_name})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/admin/test')
 @require_admin_login
 def admin_test():
@@ -4536,15 +4985,14 @@ def player_api():
     """Main Xtream Codes API endpoint"""
     if not media_client:
         return jsonify({"error": "Media server not connected"}), 500
-    
-    action = request.args.get('action')
+
+    action   = request.args.get('action')
     username = request.args.get('username')
-    
-    # Log the request (helpful for debugging)
+
     if action:
         print(f"[API] Request: action={action}, user={username}")
         _record_request(action, username)
-    
+
     if not validate_session():
         return jsonify({
             "user_info": {"auth": 0, "status": "Expired", "message": "Invalid credentials"}
@@ -4612,24 +5060,33 @@ def player_api():
                         "parent_id": 0
                     })
 
-                # ── Regular library sections ────────────────────────────────
-                sections = get_cached_sections()
-                for section in sections:
-                    if section['type'] == 'movie':
-                        categories.append({
-                            "category_id":   str(section['id']),
-                            "category_name": section["title"],
-                            "parent_id": 0
-                        })
-
                 # ── Smart categories (genre, decade, collections) ───────────
-                for cat in get_smart_categories_for_movies():
-                    if is_category_enabled(cat['id'], 'movies'):
-                        categories.append({
-                            "category_id":   cat['id'],
-                            "category_name": cat['name'],
-                            "parent_id": 0
-                        })
+                smart_movie_cats = get_smart_categories_for_movies()
+                enabled_smart    = [c for c in smart_movie_cats if is_category_enabled(c['id'], 'movies')]
+
+                # ── Regular library sections ────────────────────────────────
+                # Shown only when NO categories are enabled — acts as default.
+                # When any category is enabled, suppressed to prevent duplicates.
+                any_movie_enabled = (
+                    is_category_enabled(ON_DECK_MOVIE_CAT_ID, 'movies') or
+                    is_category_enabled(UNWATCHED_MOVIE_CAT_ID, 'movies') or
+                    bool(enabled_smart)
+                )
+                if not any_movie_enabled:
+                    for section in get_cached_sections():
+                        if section['type'] == 'movie':
+                            categories.append({
+                                "category_id":   str(section['id']),
+                                "category_name": section["title"],
+                                "parent_id": 0
+                            })
+
+                for cat in enabled_smart:
+                    categories.append({
+                        "category_id":   cat['id'],
+                        "category_name": cat['name'],
+                        "parent_id": 0
+                    })
 
             except Exception as e:
                 print(f"[ERROR] Failed to get VOD categories: {e}")
@@ -4639,11 +5096,11 @@ def player_api():
     # Get VOD streams (movies)
     elif action == 'get_vod_streams':
         category_id = request.args.get('category_id')
-        limit = int(request.args.get('limit', 0))  # 0 = no limit (backward compatible)
-        
+        limit = int(request.args.get('limit', 0))
+
         print(f"[PERF] get_vod_streams: category={category_id}, limit={limit}")
         start_time = time.time()
-        
+
         movies = []
 
         # ── Continue Watching (movies) ─────────────────────────────────────
@@ -4669,24 +5126,9 @@ def player_api():
             print(f"[PERF] Returned {len(movies)} unwatched movies in {elapsed:.2f}s")
             return jsonify(movies)
 
-        # Handle "All Movies" category (category_id = "0")
+        # Handle "All Movies" / no category — delegates to safe helper
         if category_id == "0" or not category_id:
-            max_limit = limit if limit > 0 else MAX_MOVIES
-            count     = 0
-            for section in get_cached_sections():
-                if section['type'] == 'movie' and media_client:
-                    try:
-                        for movie in media_client.get_all_movies(section['id']):
-                            if count >= max_limit:
-                                break
-                            formatted = format_movie_for_xtream(movie, section['id'])
-                            if formatted:
-                                movies.append(formatted)
-                                count += 1
-                    except Exception as e:
-                        print(f"[ERROR] Error iterating movies: {e}")
-                if count >= max_limit:
-                    break
+            movies = _get_all_movies_for_enabled_categories(limit)
         elif category_id:
             cat_id_str = str(category_id)
             
@@ -4720,7 +5162,7 @@ def player_api():
                                     movies.append(formatted)
                     except Exception as e:
                         print(f"[ERROR] Error getting movies: {e}")
-        
+
         elapsed = time.time() - start_time
         print(f"[PERF] Returned {len(movies)} movies in {elapsed:.2f}s")
         return jsonify(movies)
@@ -4813,24 +5255,33 @@ def player_api():
                         "parent_id": 0
                     })
 
-                # ── Regular library sections ────────────────────────────────
-                sections = get_cached_sections()
-                for section in sections:
-                    if section['type'] == 'show':
-                        categories.append({
-                            "category_id":   str(section['id']),
-                            "category_name": section["title"],
-                            "parent_id": 0
-                        })
-
                 # ── Smart categories ────────────────────────────────────────
-                for cat in get_smart_categories_for_series():
-                    if is_category_enabled(cat['id'], 'series'):
-                        categories.append({
-                            "category_id":   cat['id'],
-                            "category_name": cat['name'],
-                            "parent_id": 0
-                        })
+                smart_series_cats = get_smart_categories_for_series()
+                enabled_smart     = [c for c in smart_series_cats if is_category_enabled(c['id'], 'series')]
+
+                # ── Regular library sections ────────────────────────────────
+                # Shown only when NO categories are enabled — acts as default.
+                # When any category is enabled, suppressed to prevent duplicates.
+                any_series_enabled = (
+                    is_category_enabled(ON_DECK_SERIES_CAT_ID, 'series') or
+                    is_category_enabled(UNWATCHED_SERIES_CAT_ID, 'series') or
+                    bool(enabled_smart)
+                )
+                if not any_series_enabled:
+                    for section in get_cached_sections():
+                        if section['type'] == 'show':
+                            categories.append({
+                                "category_id":   str(section['id']),
+                                "category_name": section["title"],
+                                "parent_id": 0
+                            })
+
+                for cat in enabled_smart:
+                    categories.append({
+                        "category_id":   cat['id'],
+                        "category_name": cat['name'],
+                        "parent_id": 0
+                    })
 
             except Exception as e:
                 print(f"[ERROR] Failed to get series categories: {e}")
@@ -4870,26 +5321,9 @@ def player_api():
             print(f"[PERF] Returned {len(series_list)} unwatched shows in {elapsed:.2f}s")
             return jsonify(series_list)
 
-        # Handle "All Series" category (category_id = "0")
+        # Handle "All Series" / no category — delegates to safe helper
         if category_id == "0" or not category_id:
-            max_limit = limit if limit > 0 else MAX_SHOWS
-            print(f"[DEBUG] Returning all series from all sections (max {max_limit})")
-            count = 0
-            for section in get_cached_sections():
-                if section['type'] == 'show' and media_client:
-                    print(f"[DEBUG] Processing TV section: {section['title']}")
-                    try:
-                        for show in media_client.get_all_shows(section['id']):
-                            if count >= max_limit:
-                                break
-                            formatted = format_series_for_xtream(show, section['id'])
-                            if formatted:
-                                series_list.append(formatted)
-                                count += 1
-                    except Exception as e:
-                        print(f"[ERROR] Error iterating shows: {e}")
-                if count >= max_limit:
-                    break
+            series_list = _get_all_series_for_enabled_categories(limit)
         elif category_id:
             cat_id_str = str(category_id)
             
@@ -5410,16 +5844,16 @@ def view_category_contents(category_type, category_id):
     if not category:
         category = next((c for c in custom_cats if c['id'] == cat_id_str), None)
     
-    # Check Plex library categories
     if not category and plex:
         try:
             section = next((s for s in get_cached_sections() if str(s["id"]) == str(category_id)), None)
-            category = {
-                'id': category_id,
-                'name': f"📁 {section["title"]}",
-                'type': 'plex_library',
-                'section_id': category_id
-            }
+            if section:
+                category = {
+                    'id':         category_id,
+                    'name':       '📁 ' + section['title'],
+                    'type':       'plex_library',
+                    'section_id': category_id
+                }
         except:
             pass
     
@@ -5637,6 +6071,21 @@ def admin_categories():
 def categories_data():
     """JSON endpoint — returns full category list with enabled state."""
     return jsonify(get_full_category_state())
+
+
+@app.route('/admin/categories/count')
+@require_admin_login
+def categories_count():
+    """Return item count for a single category — called per-category by the UI."""
+    cat_id     = request.args.get('id', '')
+    media_type = request.args.get('media_type', 'movies')
+    if not cat_id:
+        return jsonify({'count': None}), 400
+    try:
+        count = get_category_count(cat_id, media_type)
+        return jsonify({'id': cat_id, 'count': count})
+    except Exception as e:
+        return jsonify({'id': cat_id, 'count': None, 'error': str(e)})
 
 
 @app.route('/admin/categories/save', methods=['POST'])
